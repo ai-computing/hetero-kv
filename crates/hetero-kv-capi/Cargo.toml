@@ -1,0 +1,15 @@
+[package]
+name = "hetero-kv-capi"
+description = "C ABI for hetero-kv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "hetero_kv"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+hetero-kv.workspace = true

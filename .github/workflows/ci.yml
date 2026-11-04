@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        run: cargo test --workspace --exclude hetero-kv-py
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cbindgen@0.29.4
+      - name: header is current
+        run: scripts/gen-header.sh && git diff --exit-code include/hetero_kv.h
+      - name: C smoke test
+        run: tests/c/run.sh
+
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: Swatinem/rust-cache@v2
+      - name: install
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install maturin pytest
+          .venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
+          (cd crates/hetero-kv-py && ../../.venv/bin/maturin develop)
+          .venv/bin/pip install -e adapters/optimus
+      - name: pytest
+        run: .venv/bin/python -m pytest -v tests/python adapters/optimus/tests

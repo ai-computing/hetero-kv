@@ -1,0 +1,20 @@
+[build-system]
+requires = ["maturin>=1.5,<2"]
+build-backend = "maturin"
+
+[project]
+name = "hetero-kv"
+description = "Layered KV-cache transport between heterogeneous accelerators"
+requires-python = ">=3.10"
+dynamic = ["version"]
+readme = "../../README.md"
+classifiers = ["Programming Language :: Rust", "Programming Language :: Python :: 3"]
+
+[project.optional-dependencies]
+torch = ["torch"]
+test = ["pytest"]
+
+[tool.maturin]
+python-source = "python"
+module-name = "hetero_kv._native"
+features = ["pyo3/extension-module"]

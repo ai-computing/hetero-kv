@@ -118,6 +118,8 @@ adapters/               vllm, kvstore, nixl (skeletons / notes); consumers own t
 tests/python, tests/c   Python tests, C smoke test
 ```
 
+Planned work, phase by phase: [ROADMAP.md](ROADMAP.md).
+
 ## Development
 
 ```sh

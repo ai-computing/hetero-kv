@@ -8,7 +8,12 @@
 //!    +--recover (engine quiesced)-- Poisoned <---------------------------------------------+
 //! ```
 //!
-//! * **Single flight.** One request per session; `reserve` on a busy session fails with `Busy`.
+//! * **Single flight per session, many sessions per engine.** A session carries one request at a
+//!   time (`reserve` on a busy session fails with `Busy`). Serving many requests means one
+//!   shared [`Route`] (cheap to clone, `Send + Sync`) and one `Session` per request: creating
+//!   one is a few allocations, and any number may be in flight at once on the same engine and
+//!   the same destination pool, as long as their byte ranges are disjoint (an overlapping
+//!   transfer is rejected with `Busy`, changing nothing).
 //! * **Completion-fenced admission.** `admit` (which runs the caller's visibility hook, e.g.
 //!   marking a decoder's cache ready) is only accepted once `fence` verified every transfer.
 //! * **Poison on uncertainty.** An engine failure, an inconsistent completion, a failed admit
@@ -32,7 +37,7 @@ pub use agent::{Agent, AgentMeta};
 
 use crate::engine::{Direction, Route, Transfer};
 use crate::error::{invalid, Error, Result};
-use crate::kv::{plan, KvBufferRef, Selection};
+use crate::kv::{plan, plan_converting, KvBufferRef, Selection};
 
 /// Lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,12 +224,12 @@ impl Session {
             return invalid("at least one destination buffer required");
         }
         for d in &dst {
-            if d.kind() != self.route.dst()
-                || d.spec().representation() != self.route.representation()
+            if d.location() != self.route.dst()
+                || d.spec().representation() != self.route.dst_representation()
             {
                 return Err(Error::Unsupported(format!(
                     "destination {} / {} does not match route {:?}",
-                    d.kind(),
+                    d.location(),
                     d.spec().representation(),
                     self.route
                 )));
@@ -267,9 +272,12 @@ impl Session {
             .get(group)
             .ok_or_else(|| Error::Invalid(format!("no destination group {group}")))?
             .clone();
-        if src.spec().representation() != self.route.representation() {
+        if src.location() != self.route.src()
+            || src.spec().representation() != self.route.representation()
+        {
             return Err(Error::Unsupported(format!(
-                "source representation {} does not match route {:?}",
+                "source {} / {} does not match route {:?}",
+                src.location(),
                 src.spec().representation(),
                 self.route
             )));
@@ -280,7 +288,13 @@ impl Session {
         let mut spans = Vec::new();
         let mut layers = Vec::new();
         for sel in selections {
-            let plan = plan(src.spec(), dst.spec(), sel)?;
+            // Differing representations are planned only for a route that declared the
+            // conversion (both sides were checked against the route above).
+            let plan = if self.route.converts() {
+                plan_converting(src.spec(), dst.spec(), sel)?
+            } else {
+                plan(src.spec(), dst.spec(), sel)?
+            };
             spans.extend_from_slice(plan.spans());
             layers.extend(plan.layers());
         }

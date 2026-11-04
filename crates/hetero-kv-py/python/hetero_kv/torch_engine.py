@@ -11,16 +11,25 @@ from typing import Any, Iterable
 from ._native import CopyJob, Region
 
 
+def tensor_location(device: Any) -> str:
+    """hetero-kv location of a torch device: ``host`` or ``cuda:<index>``."""
+    if device.type == "cpu":
+        return "host"
+    if device.type == "cuda":
+        import torch
+
+        return f"cuda:{device.index if device.index is not None else torch.cuda.current_device()}"
+    raise ValueError(f"no memory location for device {device}")
+
+
 def tensor_region(tensor: Any) -> Region:
-    """Wrap a contiguous tensor's storage as a region (kind ``host`` or ``cuda``). The tensor
-    stays alive as long as the region and is what the engine receives as ``RegionInfo.obj``."""
+    """Wrap a contiguous tensor's storage as a region at ``host`` or ``cuda:<index>``. The
+    tensor stays alive as long as the region and is what the engine receives as
+    ``RegionInfo.obj``."""
     if not tensor.is_contiguous():
         raise ValueError("tensor regions must be contiguous")
-    kinds = {"cpu": "host", "cuda": "cuda"}
-    kind = kinds.get(tensor.device.type)
-    if kind is None:
-        raise ValueError(f"no memory kind for device {tensor.device}")
-    return Region.external(kind, tensor.data_ptr(), tensor.numel() * tensor.element_size(), tensor)
+    location = tensor_location(tensor.device)
+    return Region.external(location, tensor.data_ptr(), tensor.numel() * tensor.element_size(), tensor)
 
 
 def _bytes(info):
@@ -40,7 +49,8 @@ class TorchCopyEngine:
 
     def __init__(self, kinds: Iterable[str] = ("host", "cuda")):
         kinds = tuple(kinds)
-        # Byte copies are representation-agnostic: None means every representation.
+        # Every device of each kind; byte copies are representation-agnostic (None = all
+        # representations, identity only: copy_ on uint8 views never converts).
         self.capabilities = [(s, d, None) for s in kinds for d in kinds]
 
     def submit(self, job: CopyJob):

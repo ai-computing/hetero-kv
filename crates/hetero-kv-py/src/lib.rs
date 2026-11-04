@@ -13,13 +13,14 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyInt, PyList, PyType};
 
 use hetero_kv::engine::{
-    Capabilities, Completion, CopyEngine, CopyJob, Direction, HostEngine, Representation, Route,
+    Capabilities, Completion, CopyEngine, CopyJob, DevicePattern, Direction, HostEngine,
+    Representation, Route,
 };
 use hetero_kv::kv::{
     self, Axis, BlockHash, Geometry, KvBuffer, KvBufferRef, KvDescriptor, KvEvent, KvKind, KvSpec,
     Layout, Selection, Split, Strides,
 };
-use hetero_kv::memory::{MemoryKind, Region};
+use hetero_kv::memory::{Location, MemoryKind, Region};
 use hetero_kv::session::{self as sess, AgentMeta, Receipt};
 use hetero_kv::Error;
 
@@ -108,13 +109,16 @@ impl PyRegion {
         Ok(Self::wrap(Region::host(nbytes).py()?))
     }
 
-    /// Wrap a writable, C-contiguous buffer (bytearray, numpy array, mmap, ...) as host memory.
+    /// Wrap a writable, C-contiguous buffer (bytearray, numpy array, mmap, ...) as host memory
+    /// (`location` "host" or "host_pinned").
     #[staticmethod]
-    #[pyo3(signature = (obj, kind = "host"))]
-    fn from_buffer(obj: &Bound<'_, PyAny>, kind: &str) -> PyResult<Self> {
-        let kind: MemoryKind = parse(kind)?;
-        if !kind.is_host() {
-            return Err(PyValueError::new_err("from_buffer wraps host memory only"));
+    #[pyo3(signature = (obj, location = "host"))]
+    fn from_buffer(obj: &Bound<'_, PyAny>, location: &str) -> PyResult<Self> {
+        let location: Location = parse(location)?;
+        if !location.kind.is_host() || location.node.is_some() {
+            return Err(PyValueError::new_err(
+                "from_buffer wraps local host memory only",
+            ));
         }
         let view = PyBuffer::<u8>::get(obj)?;
         if view.readonly() || !view.is_c_contiguous() {
@@ -129,24 +133,30 @@ impl PyRegion {
         };
         // SAFETY: the exported buffer view pins `addr..addr+len` while the region lives; the
         // caller must not use the object's memory while the region is lent.
-        let r = unsafe { Region::external(kind, addr, len, Some(Box::new(keep))) }.py()?;
+        let r = unsafe { Region::external(location, addr, len, Some(Box::new(keep))) }.py()?;
         Ok(Self::wrap(r))
     }
 
-    /// Wrap memory described by an address (e.g. `tensor.data_ptr()`); `obj` keeps it alive and
-    /// is handed to engines as `RegionInfo.obj`. The caller vouches for the address.
+    /// Wrap memory at `location` ("host", "cuda:1", "rngd:3", ...) described by an address (e.g.
+    /// `tensor.data_ptr()`); `obj` keeps it alive and is handed to engines as `RegionInfo.obj`.
+    /// The caller vouches for the address.
     #[staticmethod]
-    fn external(kind: &str, addr: usize, nbytes: usize, obj: Py<PyAny>) -> PyResult<Self> {
-        let kind: MemoryKind = parse(kind)?;
+    fn external(location: &str, addr: usize, nbytes: usize, obj: Py<PyAny>) -> PyResult<Self> {
+        let location: Location = parse(location)?;
         let keep = PyKeep { obj, _view: None };
         // SAFETY: documented caller contract (see the Python docstring).
-        let r = unsafe { Region::external(kind, addr, nbytes, Some(Box::new(keep))) }.py()?;
+        let r = unsafe { Region::external(location, addr, nbytes, Some(Box::new(keep))) }.py()?;
         Ok(Self::wrap(r))
     }
 
     #[getter]
     fn kind(&self) -> PyResult<&'static str> {
         self.with(|r| Ok(r.kind().as_str()))
+    }
+    /// "kind:index[@node]".
+    #[getter]
+    fn location(&self) -> PyResult<String> {
+        self.with(|r| Ok(r.location().to_string()))
     }
     #[getter]
     fn nbytes(&self) -> PyResult<usize> {
@@ -230,18 +240,23 @@ impl PyHostEngine {
             engine: Arc::new(HostEngine::new()),
         }
     }
-    /// Served `(src_kind, dst_kind, representation)` triples.
+    /// Served `(src_devices, dst_devices, src_repr, dst_repr)` routes.
     #[getter]
-    fn capabilities(&self) -> Vec<(&'static str, &'static str, &'static str)> {
-        caps_list(self.engine.capabilities())
+    fn capabilities(&self) -> Vec<(String, String, &'static str, &'static str)> {
+        self.engine
+            .capabilities()
+            .routes()
+            .iter()
+            .map(|c| {
+                (
+                    c.src.to_string(),
+                    c.dst.to_string(),
+                    c.src_repr.as_str(),
+                    c.dst_repr.as_str(),
+                )
+            })
+            .collect()
     }
-}
-
-fn caps_list(c: &Capabilities) -> Vec<(&'static str, &'static str, &'static str)> {
-    c.routes()
-        .iter()
-        .map(|(s, d, r)| (s.as_str(), d.as_str(), r.as_str()))
-        .collect()
 }
 
 /// `(src_index, src_offset, dst_index, dst_offset, nbytes)`.
@@ -251,6 +266,10 @@ type SpanTuple = (u32, u64, u32, u64, u64);
 #[pyclass(name = "RegionInfo", module = "hetero_kv", frozen, get_all)]
 struct RegionInfo {
     kind: &'static str,
+    /// "kind:index[@node]".
+    location: String,
+    /// Device index within the kind.
+    index: u32,
     addr: usize,
     nbytes: usize,
     /// The object passed to `Region.external`/`from_buffer` (e.g. a tensor), else None.
@@ -264,13 +283,20 @@ struct PyCopyJob {
     dst: Vec<Py<RegionInfo>>,
     /// `(src_index, src_offset, dst_index, dst_offset, nbytes)` tuples; destinations never overlap.
     spans: Vec<SpanTuple>,
+    /// Source representation.
     representation: &'static str,
+    /// Destination representation (differs only on converting routes).
+    dst_representation: &'static str,
     direction: &'static str,
+    /// Source bytes of the job: what `wait` must return.
     nbytes: u64,
 }
 
 /// A `CopyEngine` implemented by a Python object with `name`, `capabilities`,
 /// `submit(job) -> ticket`, `poll(ticket) -> bool`, `wait(ticket) -> int` and `quiesce()`.
+/// Capabilities are `(src, dst, repr | None)` identity routes (None = every representation) or
+/// `(src, dst, src_repr, dst_repr)` conversions; `src`/`dst` are device patterns such as
+/// "cuda" (any index), "cuda:1" or "host".
 struct PyEngine {
     obj: Py<PyAny>,
     name: String,
@@ -290,12 +316,19 @@ impl PyEngine {
             .unwrap_or_else(|_| "python".into());
         let mut caps = Capabilities::new();
         for item in obj.getattr("capabilities")?.try_iter()? {
-            let (s, d, r): (String, String, Option<String>) = item?.extract()?;
+            let item = item?;
+            if let Ok((s, d, a, b)) = item.extract::<(String, String, String, String)>() {
+                let (s, d): (DevicePattern, DevicePattern) = (parse(&s)?, parse(&d)?);
+                caps = caps.allow_conversion(s, d, parse(&a)?, parse(&b)?);
+                continue;
+            }
+            let (s, d, r): (String, String, Option<String>) = item.extract()?;
             let reprs = match r {
                 Some(r) => vec![parse::<Representation>(&r)?],
                 None => Representation::ALL.to_vec(),
             };
-            caps = caps.allow(parse(&s)?, parse(&d)?, &reprs);
+            let (s, d): (DevicePattern, DevicePattern) = (parse(&s)?, parse(&d)?);
+            caps = caps.allow(s, d, &reprs);
         }
         Ok(PyEngine {
             obj: obj.clone().unbind(),
@@ -318,6 +351,8 @@ fn region_info(py: Python<'_>, r: &hetero_kv::memory::RegionRef) -> PyResult<Py<
         py,
         RegionInfo {
             kind: r.kind().as_str(),
+            location: r.location().to_string(),
+            index: r.location().index,
             addr: r.addr(),
             nbytes: r.len(),
             obj,
@@ -382,6 +417,7 @@ impl CopyEngine for PyEngine {
                     .map(|s| (s.src, s.src_offset, s.dst, s.dst_offset, s.len))
                     .collect(),
                 representation: job.representation.as_str(),
+                dst_representation: job.dst_representation.as_str(),
                 direction: job.direction.as_str(),
                 nbytes: job.bytes(),
             };
@@ -756,6 +792,10 @@ impl PyKvBuffer {
     fn kind(&self) -> PyResult<&'static str> {
         Ok(self.share()?.kind().as_str())
     }
+    #[getter]
+    fn location(&self) -> PyResult<String> {
+        Ok(self.share()?.location().to_string())
+    }
     /// Ownership phase of each region ("lent", "in_flight", "done", "uncertain").
     fn phases(&self) -> PyResult<Vec<&'static str>> {
         let g = self.inner.lock().unwrap();
@@ -804,6 +844,10 @@ impl PyBufferRef {
     #[getter]
     fn kind(&self) -> &'static str {
         self.inner.kind().as_str()
+    }
+    #[getter]
+    fn location(&self) -> String {
+        self.inner.location().to_string()
     }
 }
 
@@ -978,6 +1022,71 @@ fn receipt_dict<'py>(py: Python<'py>, r: &Receipt) -> PyResult<Bound<'py, PyDict
     Ok(d)
 }
 
+/// An explicitly selected route over one engine. Share one Route between many sessions (one
+/// per request); it is thread-safe and cloning it is cheap.
+#[pyclass(name = "Route", module = "hetero_kv", frozen)]
+struct PyRoute {
+    inner: Route,
+}
+
+fn select_route(
+    engine: &Bound<'_, PyAny>,
+    src: &str,
+    dst: &str,
+    representation: &str,
+    dst_representation: Option<&str>,
+) -> PyResult<Route> {
+    let (src, dst): (Location, Location) = (parse(src)?, parse(dst)?);
+    let from: Representation = parse(representation)?;
+    let to = match dst_representation {
+        Some(r) => parse(r)?,
+        None => from,
+    };
+    Route::select_converting(engine_arc(engine)?, src, dst, from, to).py()
+}
+
+#[pymethods]
+impl PyRoute {
+    /// Raises UnsupportedError unless `engine` (a `HostEngine` or Python engine object) declared
+    /// `src -> dst` for `representation -> dst_representation` (default: no conversion).
+    #[new]
+    #[pyo3(signature = (engine, src = "host", dst = "host", representation = "bf16", dst_representation = None))]
+    fn new(
+        engine: &Bound<'_, PyAny>,
+        src: &str,
+        dst: &str,
+        representation: &str,
+        dst_representation: Option<&str>,
+    ) -> PyResult<Self> {
+        Ok(PyRoute {
+            inner: select_route(engine, src, dst, representation, dst_representation)?,
+        })
+    }
+    #[getter]
+    fn src(&self) -> String {
+        self.inner.src().to_string()
+    }
+    #[getter]
+    fn dst(&self) -> String {
+        self.inner.dst().to_string()
+    }
+    #[getter]
+    fn representation(&self) -> &'static str {
+        self.inner.representation().as_str()
+    }
+    #[getter]
+    fn dst_representation(&self) -> &'static str {
+        self.inner.dst_representation().as_str()
+    }
+    #[getter]
+    fn engine(&self) -> String {
+        self.inner.engine_name().to_owned()
+    }
+    fn __repr__(&self) -> String {
+        format!("{:?}", self.inner)
+    }
+}
+
 /// Transfer lifecycle for one destination lease over an explicitly selected route.
 #[pyclass(name = "Session", module = "hetero_kv", frozen)]
 struct PySession {
@@ -986,23 +1095,22 @@ struct PySession {
 
 #[pymethods]
 impl PySession {
-    /// `engine` is a `HostEngine` or a Python engine object. Raises UnsupportedError if it does
-    /// not serve `(src_kind, dst_kind, representation)`; there is no fallback.
+    /// `Session(route)` with a shared `Route` (the pattern for many concurrent requests), or
+    /// `Session(engine, src, dst, representation, dst_representation)` as a shorthand that
+    /// selects a route first. Raises UnsupportedError for an undeclared route; no fallback.
     #[new]
-    #[pyo3(signature = (engine, src_kind = "host", dst_kind = "host", representation = "bf16"))]
+    #[pyo3(signature = (engine, src = "host", dst = "host", representation = "bf16", dst_representation = None))]
     fn new(
         engine: &Bound<'_, PyAny>,
-        src_kind: &str,
-        dst_kind: &str,
+        src: &str,
+        dst: &str,
         representation: &str,
+        dst_representation: Option<&str>,
     ) -> PyResult<Self> {
-        let route = Route::select(
-            engine_arc(engine)?,
-            parse(src_kind)?,
-            parse(dst_kind)?,
-            parse(representation)?,
-        )
-        .py()?;
+        let route = match engine.cast::<PyRoute>() {
+            Ok(r) => r.get().inner.clone(),
+            Err(_) => select_route(engine, src, dst, representation, dst_representation)?,
+        };
         Ok(PySession {
             inner: Arc::new(sess::Session::new(route)),
         })
@@ -1263,6 +1371,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyBufferRef>()?;
     m.add_class::<PyKvDescriptor>()?;
     m.add_class::<PyLayerProgress>()?;
+    m.add_class::<PyRoute>()?;
     m.add_class::<PySession>()?;
     m.add_class::<PyAgent>()?;
     m.add_function(wrap_pyfunction!(decode_agent_meta, m)?)?;

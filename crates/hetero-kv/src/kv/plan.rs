@@ -113,7 +113,22 @@ fn check_side(name: &str, layout: &Layout, table: &[u32], start: u64, tokens: u6
 }
 
 /// Build the byte-span plan that copies `sel` from a `src`-shaped buffer to a `dst`-shaped one.
+/// Both must use the same representation; see [`plan_converting`].
 pub fn plan(src: &KvSpec, dst: &KvSpec, sel: &Selection) -> Result<Plan> {
+    if src.representation() != dst.representation() {
+        return invalid(format!(
+            "source is {} but destination is {}; that needs a converting route",
+            src.representation(),
+            dst.representation()
+        ));
+    }
+    plan_converting(src, dst, sel)
+}
+
+/// Like [`plan`], but allows the representations to differ. Span lengths are in source bytes;
+/// the destination range of a span is its length converted to the destination element size.
+/// Only a route that declared the conversion may execute such a plan (the session checks).
+pub fn plan_converting(src: &KvSpec, dst: &KvSpec, sel: &Selection) -> Result<Plan> {
     src.compatible(dst)?;
     let (sl, dl) = (&src.layout, &dst.layout);
     let g = *sl.geometry();
@@ -131,6 +146,8 @@ pub fn plan(src: &KvSpec, dst: &KvSpec, sel: &Selection) -> Result<Plan> {
     check_side("destination", dl, &sel.dst_blocks, sel.dst_start, tokens)?;
 
     let row = g.row_bytes();
+    let (from, to) = (src.representation(), dst.representation());
+    let scale = |len: u64| from.convert_len(len, to);
     // Walk (layer, plane, token, head) nested in the source's physical order (largest stride
     // outermost; region-selecting axes count as infinite), so consecutive rows are usually
     // adjacent on both sides and coalesce into few spans.
@@ -180,7 +197,7 @@ pub fn plan(src: &KvSpec, dst: &KvSpec, sel: &Selection) -> Result<Plan> {
                 if p.src == sr
                     && p.dst == dr
                     && p.src_offset + p.len == so
-                    && p.dst_offset + p.len == dof =>
+                    && p.dst_offset + scale(p.len) == dof =>
             {
                 p.len += row
             }
@@ -331,6 +348,26 @@ mod tests {
         );
         let dst = spec(Layout::bhsd(g(KvKind::KeyValue, 1, 20)).unwrap());
         check(&slab, &dst, &Selection::contiguous(1..3, 2, 7, 4));
+    }
+
+    #[test]
+    fn conversion_needs_the_converting_planner() {
+        let bf16 = spec(Layout::layer_separate(g(KvKind::KeyValue, 4, 4)).unwrap());
+        let mut g32 = g(KvKind::KeyValue, 4, 4);
+        g32.representation = Representation::Fp32;
+        let fp32 = spec(Layout::layer_separate(g32).unwrap());
+        let sel = Selection::blocks(0..3, vec![1, 2], vec![2, 3]);
+        assert!(plan(&bf16, &fp32, &sel).is_err());
+        let p = plan_converting(&bf16, &fp32, &sel).unwrap();
+        let same = plan(&fp32, &fp32, &sel).unwrap();
+        // Same destination coverage as an fp32 -> fp32 copy, at half the source bytes.
+        assert_eq!(p.spans().len(), same.spans().len());
+        for (a, b) in p.spans().iter().zip(same.spans()) {
+            assert_eq!(
+                (a.dst, a.dst_offset, a.len * 2),
+                (b.dst, b.dst_offset, b.len)
+            );
+        }
     }
 
     #[test]

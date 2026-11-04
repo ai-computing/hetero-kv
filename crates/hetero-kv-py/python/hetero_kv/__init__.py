@@ -1,6 +1,6 @@
 """hetero-kv: layered KV-cache transport between heterogeneous accelerators.
 
-L1 ``Region`` · L2 ``HostEngine`` / Python engines · L3 ``Layout``, ``KVSpec``, ``KVBuffer``,
+L1 ``Region`` · L2 ``Route``, ``HostEngine`` / Python engines · L3 ``Layout``, ``KVSpec``, ``KVBuffer``,
 ``KVDescriptor``, ``Selection``, ``LayerProgress`` · L4 ``Session``, ``Agent``.
 """
 
@@ -35,6 +35,7 @@ from ._native import (
     Layout,
     Region,
     RegionInfo,
+    Route,
     Session,
     canonical_representation,
     decode_agent_meta,
@@ -91,6 +92,6 @@ __all__ = [
     "Agent", "BufferRef", "BusyError", "CancelledError", "CopyJob", "HeteroKVError", "HostEngine",
     "InvalidError", "KVBuffer", "KVDescriptor", "KVSpec", "LAYOUT_VERSION", "LayerProgress",
     "Layout", "MEMORY_KINDS", "PoisonedError", "REPRESENTATIONS", "Region", "RegionInfo",
-    "Selection", "Session", "StateError", "TransferError", "UnsupportedError", "WIRE_VERSION",
+    "Route", "Selection", "Session", "StateError", "TransferError", "UnsupportedError", "WIRE_VERSION",
     "canonical_representation", "decode_agent_meta", "plan", "transfer_and_admit",
 ]

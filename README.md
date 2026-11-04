@@ -16,8 +16,8 @@ PDMA <-> DMA-BUF (P2), NIXL and cross-process sessions (P3) follow; see Issue #1
 | L5 | `hetero-kv-py`, `hetero-kv-capi`, `adapters/` | Python package `hetero_kv`, C ABI (`include/hetero_kv.h`), consumer adapters |
 | L4 | `session` | reserve -> transfer -> fence -> admit -> finish, cancel, poison/recover; agents |
 | L3 | `kv` | `KvSpec`, paged/strided `Layout`, `Selection` -> byte-span `Plan`, `LayerProgress`, buffers, descriptors, block events |
-| L2 | `engine` | `CopyEngine`, capability matrix, explicit `Route` (no fallback), async `Transfer`, `HostEngine` |
-| L1 | `memory` | `Region`, ownership state machine (Owned -> Lent -> InFlight -> Done / Uncertain), registration |
+| L2 | `engine` | `CopyEngine`, capability matrix (device patterns, declared conversions), explicit `Route` (no fallback), async `Transfer`, `HostEngine` |
+| L1 | `memory` | `Region` at a `Location` (kind, device index), byte-range ownership state machine (Owned -> Lent -> InFlight -> Done / Uncertain), registration |
 
 Rules and diagrams: [ARCHITECTURE.md](ARCHITECTURE.md). Consumer mapping and gaps:
 [INTEGRATION.md](INTEGRATION.md).
@@ -39,7 +39,8 @@ spec = hk.KVSpec("my-model", "rev-1", layout)
 new = lambda: hk.KVBuffer(spec, [hk.Region.host(layout.region_bytes) for _ in range(layout.region_count)])
 src, dst = new(), new()
 
-session = hk.Session(hk.HostEngine(), "host", "host", "bf16")    # explicit route; no fallback
+route = hk.Route(hk.HostEngine(), "host", "host", "bf16")        # explicit route; no fallback
+session = hk.Session(route)                                       # one per request; share the route
 session.reserve("req-1", dst)
 tid = session.transfer("req-1", src, hk.Selection.prefix(5))      # async; returns a transfer id
 receipt = session.fence("req-1")                                  # every completion verified
@@ -47,8 +48,12 @@ session.admit("req-1", notify=lambda: print("cache visible"))     # only after t
 session.finish("req-1")
 ```
 
-Engines can be Python objects (`name`, `capabilities`, `submit`, `poll`, `wait`, `quiesce`);
-`hetero_kv.torch_engine.TorchCopyEngine` copies tensor-backed regions with `Tensor.copy_`.
+Locations name devices: `Region.external("rngd:3", addr, nbytes, owner)`,
+`hk.Route(engine, "rngd:3", "atom:2", "bf16", "dlfloat16")` (only if the engine declared that
+conversion). Engines can be Python objects (`name`, `capabilities`, `submit`, `poll`, `wait`,
+`quiesce`); `hetero_kv.torch_engine.TorchCopyEngine` copies tensor-backed regions
+(`host`, `cuda:N`) with `Tensor.copy_`. Many sessions over one route may be in flight at once on
+one KV pool as long as their byte ranges are disjoint.
 
 ### Rust
 
@@ -68,6 +73,7 @@ let alloc = || -> hetero_kv::Result<KvBuffer> {
 };
 let (src, dst) = (alloc()?, alloc()?);
 let route = Route::select(Arc::new(HostEngine::new()), MemoryKind::Host, MemoryKind::Host, Representation::Bf16)?;
+// Share `route` (cheap clone) across threads; create one Session per request.
 let session = Session::new(route);
 session.reserve("req-1", vec![dst.share()])?;
 session.transfer("req-1", 0, &src.share(), &[Selection::prefix(0..2, 5)], Direction::Write)?;
@@ -84,9 +90,11 @@ session.finish("req-1", true)?;
 hkv_geometry g = {HKV_BF16, 0, 2, 1, 16, 2, 8};
 hkv_spec *spec = hkv_spec_new("my-model", "rev-1", HKV_LAYOUT_BHSD, &g);
 hkv_engine *engine = hkv_host_engine_new();
-hkv_session *s = hkv_session_new(engine, HKV_MEM_HOST, HKV_MEM_HOST, HKV_BF16);
+hkv_location host = {HKV_MEM_HOST, 0, false, 0};
+hkv_session *s = hkv_session_new(engine, host, host, HKV_BF16, HKV_BF16);   /* one per request */
 /* buffers: hkv_region_host_new + hkv_buffer_new; then
-   hkv_session_reserve -> hkv_session_transfer -> hkv_session_fence -> hkv_session_admit -> hkv_session_finish */
+   hkv_session_reserve -> hkv_session_transfer -> hkv_session_fence -> hkv_session_admit -> hkv_session_finish;
+   descriptors: hkv_agent_export -> hkv_descriptor_to_bytes / _from_bytes -> hkv_descriptor_resolve */
 ```
 
 Full example: [`tests/c/smoke.c`](tests/c/smoke.c). Every call returns `hkv_status`;

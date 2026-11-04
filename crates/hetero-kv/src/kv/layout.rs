@@ -358,7 +358,8 @@ impl Layout {
 }
 
 /// What a KV buffer holds: model identity plus physical layout. Two buffers can exchange
-/// data only if [`KvSpec::compatible`] holds; block counts, block sizes and strides may differ.
+/// data only if [`KvSpec::compatible`] holds; block counts, block sizes and strides may differ,
+/// and representations may differ only over a converting route.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct KvSpec {
     /// Model identifier.
@@ -397,14 +398,13 @@ impl KvSpec {
         self.layout.geometry.layers
     }
 
-    /// Ok if rows of `self` and `other` mean the same thing (model, revision, representation,
-    /// layout version, planes, layers, heads, head_dim).
+    /// Ok if rows of `self` and `other` hold the same logical data (model, revision, layout
+    /// version, planes, layers, heads, head_dim). Representation is checked by the planner:
+    /// see [`crate::kv::plan`] and [`crate::kv::plan_converting`].
     pub fn compatible(&self, other: &KvSpec) -> Result<()> {
         let (a, b) = (&self.layout.geometry, &other.layout.geometry);
         let what = if self.model_id != other.model_id || self.revision != other.revision {
             "model revision"
-        } else if a.representation != b.representation {
-            "representation"
         } else if self.layout.version != other.layout.version {
             "layout version"
         } else if (a.kv, a.layers, a.heads, a.head_dim) != (b.kv, b.layers, b.heads, b.head_dim) {
@@ -496,7 +496,7 @@ mod tests {
             ..geom(1, 128)
         };
         let d = KvSpec::new("m", "r", Layout::bhsd(fp16).unwrap()).unwrap();
-        assert!(a.compatible(&d).is_err());
+        a.compatible(&d).unwrap(); // representation is the planner's business
         assert!(KvSpec::new(" ", "r", b.layout).is_err());
     }
 }

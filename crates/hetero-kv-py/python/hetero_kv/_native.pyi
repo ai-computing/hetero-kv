@@ -9,11 +9,13 @@ class Region:
     @staticmethod
     def host(nbytes: int) -> Region: ...
     @staticmethod
-    def from_buffer(obj: Any, kind: str = "host") -> Region: ...
+    def from_buffer(obj: Any, location: str = "host") -> Region: ...
     @staticmethod
-    def external(kind: str, addr: int, nbytes: int, obj: Any) -> Region: ...
+    def external(location: str, addr: int, nbytes: int, obj: Any) -> Region: ...
     @property
     def kind(self) -> str: ...
+    @property
+    def location(self) -> str: ...
     @property
     def nbytes(self) -> int: ...
     @property
@@ -26,10 +28,12 @@ class Region:
 class HostEngine:
     def __init__(self) -> None: ...
     @property
-    def capabilities(self) -> list[tuple[str, str, str]]: ...
+    def capabilities(self) -> list[tuple[str, str, str, str]]: ...
 
 class RegionInfo:
     kind: str
+    location: str
+    index: int
     addr: int
     nbytes: int
     obj: Any
@@ -39,8 +43,24 @@ class CopyJob:
     dst: list[RegionInfo]
     spans: list[tuple[int, int, int, int, int]]
     representation: str
+    dst_representation: str
     direction: str
     nbytes: int
+
+class Route:
+    def __init__(
+        self,
+        engine: Any,
+        src: str = "host",
+        dst: str = "host",
+        representation: str = "bf16",
+        dst_representation: Optional[str] = None,
+    ) -> None: ...
+    src: str
+    dst: str
+    representation: str
+    dst_representation: str
+    engine: str
 
 class Layout:
     def __init__(
@@ -95,12 +115,14 @@ class KVBuffer:
     def __init__(self, spec: KVSpec, regions: list[Region]) -> None: ...
     spec: KVSpec
     kind: str
+    location: str
     def phases(self) -> list[str]: ...
     def reclaim(self) -> list[Region]: ...
 
 class BufferRef:
     spec: KVSpec
     kind: str
+    location: str
 
 Buffer = Union[KVBuffer, BufferRef]
 
@@ -126,7 +148,12 @@ class LayerProgress:
 
 class Session:
     def __init__(
-        self, engine: Any, src_kind: str = "host", dst_kind: str = "host", representation: str = "bf16"
+        self,
+        engine: Union[Route, Any],
+        src: str = "host",
+        dst: str = "host",
+        representation: str = "bf16",
+        dst_representation: Optional[str] = None,
     ) -> None: ...
     state: str
     request_id: Optional[str]

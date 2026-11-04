@@ -396,7 +396,6 @@ fn per_layer_completion() {
         &[Selection::prefix(0..1, 4)],
         Direction::Write,
     );
-    // A region can only carry one copy at a time: layer 1 lives in other regions (bhsd split).
     let t1 = s.transfer(
         "r",
         0,
@@ -521,4 +520,270 @@ fn several_selections_form_one_job() {
     assert_eq!((r.transfers, r.bytes), (1, 2 * 2 * 2 * 2 * 3 * 8));
     s.admit("r", || Ok(())).unwrap();
     s.finish("r", true).unwrap();
+}
+
+/// Host engine whose copies happen at `wait`, so many jobs are genuinely in flight at once.
+struct Deferred {
+    caps: Capabilities,
+    submitted: AtomicUsize,
+}
+
+struct DeferredCompletion(Vec<(usize, usize, usize)>, u64);
+impl Completion for DeferredCompletion {
+    fn poll(&mut self) -> Result<Option<u64>> {
+        Ok(None)
+    }
+    fn wait(&mut self) -> Result<u64> {
+        for &(s, d, n) in &self.0 {
+            // SAFETY: ranges were validated and claimed by Route::submit.
+            unsafe { std::ptr::copy(s as *const u8, d as *mut u8, n) };
+        }
+        self.0.clear();
+        Ok(self.1)
+    }
+}
+
+impl CopyEngine for Deferred {
+    fn name(&self) -> &str {
+        "deferred"
+    }
+    fn capabilities(&self) -> &Capabilities {
+        &self.caps
+    }
+    fn submit(&self, job: &CopyJob<'_>) -> Result<Box<dyn Completion>> {
+        self.submitted.fetch_add(1, Ordering::SeqCst);
+        let copies = job
+            .spans
+            .iter()
+            .map(|s| {
+                let src = job.src[s.src as usize].addr() + s.src_offset as usize;
+                let dst = job.dst[s.dst as usize].addr() + s.dst_offset as usize;
+                (src, dst, s.len as usize)
+            })
+            .collect();
+        Ok(Box::new(DeferredCompletion(copies, job.bytes())))
+    }
+    fn quiesce(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+fn paged(blocks: u32, seed: Option<u8>) -> KvBuffer {
+    let g = Geometry {
+        representation: Representation::Fp16,
+        kv: KvKind::KeyValue,
+        layers: 3,
+        blocks,
+        block_size: 4,
+        heads: 2,
+        head_dim: 8,
+    };
+    let s = KvSpec::new("m", "r", Layout::layer_separate(g).unwrap()).unwrap();
+    let n = s.layout.region_bytes() as usize;
+    let regions = (0..3)
+        .map(|_| {
+            let mut r = Region::host(n).unwrap();
+            if let Some(seed) = seed {
+                r.as_mut_slice().unwrap().fill(seed);
+            }
+            r
+        })
+        .collect();
+    KvBuffer::new(s, regions).unwrap()
+}
+
+#[test]
+fn many_sessions_share_one_engine_and_one_pool() {
+    // One shared route (one engine), one session per request, N requests in flight at once,
+    // each writing its own block of one paged pool (vLLM / KV-manager pattern).
+    const N: usize = 8;
+    let engine = Arc::new(Deferred {
+        caps: Capabilities::new().allow(MemoryKind::Host, MemoryKind::Host, &Representation::ALL),
+        submitted: AtomicUsize::new(0),
+    });
+    let route = Route::select(
+        engine.clone(),
+        MemoryKind::Host,
+        MemoryKind::Host,
+        Representation::Fp16,
+    )
+    .unwrap();
+    let pool = paged(N as u32, None);
+    let sources: Vec<KvBuffer> = (0..N).map(|i| paged(1, Some(i as u8 + 1))).collect();
+    let all_submitted = std::sync::Barrier::new(N);
+    std::thread::scope(|scope| {
+        for (i, src) in sources.iter().enumerate() {
+            let (route, pool, barrier) = (route.clone(), pool.share(), &all_submitted);
+            scope.spawn(move || {
+                let rid = format!("req-{i}");
+                let s = Session::new(route);
+                s.reserve(&rid, vec![pool]).unwrap();
+                let sel = Selection::blocks(0..3, vec![0], vec![i as u32]);
+                s.transfer(&rid, 0, &src.share(), &[sel], Direction::Write)
+                    .unwrap();
+                barrier.wait(); // every request has a copy in flight on the same pool
+                s.fence(&rid).unwrap();
+                s.admit(&rid, || Ok(())).unwrap();
+                s.finish(&rid, true).unwrap();
+            });
+        }
+    });
+    assert_eq!(engine.submitted.load(Ordering::SeqCst), N);
+    let regions = pool.reclaim().unwrap();
+    let block = 4 * 2 * 8 * 2; // bytes per block per plane: tokens x heads x head_dim x fp16
+    for r in &regions {
+        let bytes = r.as_slice().unwrap();
+        for i in 0..N {
+            for kv in 0..2 {
+                let off = kv * N * block + i * block; // region is [kv, block, token, head, dim]
+                assert!(bytes[off..off + block].iter().all(|&b| b == i as u8 + 1));
+            }
+        }
+    }
+}
+
+#[test]
+fn overlapping_transfer_is_busy_and_changes_nothing() {
+    let engine = Arc::new(Deferred {
+        caps: Capabilities::new().allow(MemoryKind::Host, MemoryKind::Host, &Representation::ALL),
+        submitted: AtomicUsize::new(0),
+    });
+    let route = Route::select(
+        engine.clone(),
+        MemoryKind::Host,
+        MemoryKind::Host,
+        Representation::Fp16,
+    )
+    .unwrap();
+    let pool = paged(4, None);
+    let (a, b) = (paged(1, Some(1)), paged(1, Some(2)));
+    let (s1, s2) = (Session::new(route.clone()), Session::new(route));
+    s1.reserve("a", vec![pool.share()]).unwrap();
+    s2.reserve("b", vec![pool.share()]).unwrap();
+    s1.transfer(
+        "a",
+        0,
+        &a.share(),
+        &[Selection::blocks(0..3, vec![0], vec![2])],
+        Direction::Write,
+    )
+    .unwrap();
+    // Same destination block, different request: rejected before reaching the engine.
+    let e = s2
+        .transfer(
+            "b",
+            0,
+            &b.share(),
+            &[Selection::blocks(0..3, vec![0], vec![2])],
+            Direction::Write,
+        )
+        .unwrap_err();
+    assert!(matches!(e, Error::Busy(_)), "{e}");
+    assert_eq!(engine.submitted.load(Ordering::SeqCst), 1);
+    assert_eq!(s2.state(), SessionState::Reserved);
+    // A disjoint block is fine meanwhile.
+    s2.transfer(
+        "b",
+        0,
+        &b.share(),
+        &[Selection::blocks(0..3, vec![0], vec![3])],
+        Direction::Write,
+    )
+    .unwrap();
+    for (s, rid) in [(&s1, "a"), (&s2, "b")] {
+        s.fence(rid).unwrap();
+        s.admit(rid, || Ok(())).unwrap();
+        s.finish(rid, true).unwrap();
+    }
+    assert!(pool.regions().iter().all(|r| r.phase() == Phase::Done));
+}
+
+#[test]
+fn converting_routes_are_planned_only_when_declared() {
+    struct Converter(Capabilities);
+    impl CopyEngine for Converter {
+        fn name(&self) -> &str {
+            "converter"
+        }
+        fn capabilities(&self) -> &Capabilities {
+            &self.0
+        }
+        fn submit(&self, job: &CopyJob<'_>) -> Result<Box<dyn Completion>> {
+            assert_eq!(
+                (job.representation, job.dst_representation),
+                (Representation::Bf16, Representation::Dlfloat16)
+            );
+            Ok(Box::new(DeferredCompletion(Vec::new(), job.bytes())))
+        }
+        fn quiesce(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+    let caps = Capabilities::new().allow_conversion(
+        MemoryKind::Host,
+        MemoryKind::Host,
+        Representation::Bf16,
+        Representation::Dlfloat16,
+    );
+    let engine: Arc<dyn CopyEngine> = Arc::new(Converter(caps));
+    let with = |repr| {
+        let g = Geometry {
+            representation: repr,
+            ..*spec(4).layout.geometry()
+        };
+        let s = KvSpec::new("m", "r", Layout::bhsd(g).unwrap()).unwrap();
+        let n = s.layout.region_bytes() as usize;
+        KvBuffer::new(s, (0..4).map(|_| Region::host(n).unwrap()).collect()).unwrap()
+    };
+    let (src, dst) = (with(Representation::Bf16), with(Representation::Dlfloat16));
+    // Identity route on this engine does not exist.
+    assert!(Route::select(
+        engine.clone(),
+        MemoryKind::Host,
+        MemoryKind::Host,
+        Representation::Bf16
+    )
+    .is_err());
+    let route = Route::select_converting(
+        engine,
+        MemoryKind::Host,
+        MemoryKind::Host,
+        Representation::Bf16,
+        Representation::Dlfloat16,
+    )
+    .unwrap();
+    let s = Session::new(route);
+    // Destination must be in the route's destination representation.
+    assert!(matches!(
+        s.reserve("r", vec![src.share()]),
+        Err(Error::Unsupported(_))
+    ));
+    s.reserve("r", vec![dst.share()]).unwrap();
+    assert!(matches!(
+        s.transfer(
+            "r",
+            0,
+            &dst.share(),
+            &[Selection::prefix(0..2, 4)],
+            Direction::Write
+        ),
+        Err(Error::Unsupported(_))
+    ));
+    s.transfer(
+        "r",
+        0,
+        &src.share(),
+        &[Selection::prefix(0..2, 4)],
+        Direction::Write,
+    )
+    .unwrap();
+    assert_eq!(s.fence("r").unwrap().bytes, 2 * 2 * 2 * 4 * 8);
+}
+
+#[test]
+fn routes_and_sessions_are_shareable_across_threads() {
+    fn check<T: Send + Sync + 'static>() {}
+    check::<Route>();
+    check::<Session>();
+    check::<KvBufferRef>();
 }

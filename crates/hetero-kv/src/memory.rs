@@ -1,13 +1,20 @@
 //! L1 memory: regions, their ownership state machine, and registration.
 //!
-//! A region is a byte range in one memory tier. Its owner moves it through
+//! A region is a byte range at one [`Location`] (memory kind, device index, optional node). Its
+//! owner moves it through
 //!
 //! ```text
-//!   Owned --lend--> Lent --submit--> InFlight --fenced ok--> Done --reclaim--> Owned
-//!                     ^                  |                    |
-//!                     |                  +--error/drop------> Uncertain --quiesce+reclaim--> Owned
+//!   Owned --lend--> Lent --submit--> InFlight --all fenced ok--> Done --reclaim--> Owned
+//!                     ^                  |                        |
+//!                     |                  +--error/drop----------> Uncertain --quiesce+reclaim--> Owned
 //!                     +------------- (Done may be submitted again) ---+
 //! ```
+//!
+//! Ownership of in-flight bytes is tracked per byte range: many copies may be in flight on one
+//! region (e.g. a paged KV pool shared by many requests) as long as their ranges are disjoint;
+//! an overlapping submission is rejected with `Busy`. One uncertain completion taints the whole
+//! region until the engine is quiesced (conservative: a device that failed may have written
+//! anywhere it was allowed to).
 //!
 //! The types enforce the rules:
 //!
@@ -113,6 +120,77 @@ impl FromStr for MemoryKind {
     }
 }
 
+/// Where a region lives: memory kind, device index within the kind, and an optional node id
+/// (an opaque host identity for cross-host routes in later phases; `None` = this node).
+/// Written `kind[:index][@node]`, e.g. `host`, `cuda:1`, `rngd:3`, `atom:2@17`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Location {
+    /// Memory kind (tier).
+    pub kind: MemoryKind,
+    /// Device index within the kind (0 for host memory).
+    pub index: u32,
+    /// Node id for cross-host routes; `None` is the local node.
+    pub node: Option<u64>,
+}
+
+impl Location {
+    /// Pageable host memory of this node.
+    pub const HOST: Location = Location::new(MemoryKind::Host, 0);
+
+    /// Local location.
+    pub const fn new(kind: MemoryKind, index: u32) -> Location {
+        Location {
+            kind,
+            index,
+            node: None,
+        }
+    }
+
+    /// The same device on node `node`.
+    pub const fn on_node(self, node: u64) -> Location {
+        Location {
+            node: Some(node),
+            ..self
+        }
+    }
+}
+
+impl From<MemoryKind> for Location {
+    fn from(kind: MemoryKind) -> Self {
+        Location::new(kind, 0)
+    }
+}
+
+impl fmt::Display for Location {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.kind, self.index)?;
+        if let Some(n) = self.node {
+            write!(f, "@{n}")?;
+        }
+        Ok(())
+    }
+}
+
+impl FromStr for Location {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self> {
+        let bad = || Error::Invalid(format!("bad location {s:?} (expected kind[:index][@node])"));
+        let (dev, node) = match s.split_once('@') {
+            Some((d, n)) => (d, Some(n.parse::<u64>().map_err(|_| bad())?)),
+            None => (s, None),
+        };
+        let (kind, index) = match dev.split_once(':') {
+            Some((k, i)) => (k, i.parse::<u32>().map_err(|_| bad())?),
+            None => (dev, 0),
+        };
+        Ok(Location {
+            kind: kind.parse()?,
+            index,
+            node,
+        })
+    }
+}
+
 /// Ownership phase of a region (see the module diagram).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -120,9 +198,9 @@ pub enum Phase {
     Owned,
     /// Lent out, no copy outstanding.
     Lent,
-    /// A copy referencing it was submitted and is not yet fenced.
+    /// At least one copy touching it was submitted and is not yet fenced.
     InFlight,
-    /// The last copy completed and was verified.
+    /// Every copy so far completed and was verified.
     Done,
     /// A copy failed or was abandoned: contents and device activity are unknown.
     Uncertain,
@@ -161,13 +239,33 @@ enum Backing {
     External(Option<Box<dyn Any + Send + Sync>>),
 }
 
+/// Ownership state. `inflight` holds `(job, start, end)` byte ranges of unfenced copies.
 struct State {
-    phase: Phase,
+    owned: bool,
     holders: usize,
+    inflight: Vec<(u64, u64, u64)>,
+    done: bool,
+    uncertain: bool,
+}
+
+impl State {
+    fn phase(&self) -> Phase {
+        if self.owned {
+            Phase::Owned
+        } else if self.uncertain {
+            Phase::Uncertain
+        } else if !self.inflight.is_empty() {
+            Phase::InFlight
+        } else if self.done {
+            Phase::Done
+        } else {
+            Phase::Lent
+        }
+    }
 }
 
 struct Shared {
-    kind: MemoryKind,
+    location: Location,
     addr: usize,
     len: usize,
     backing: Backing,
@@ -183,7 +281,7 @@ impl Shared {
 
 impl Drop for Shared {
     fn drop(&mut self) {
-        let uncertain = self.state().phase == Phase::Uncertain;
+        let uncertain = self.state().uncertain;
         match &mut self.backing {
             Backing::Host(layout) if !uncertain => {
                 // SAFETY: allocated in `Region::host` with exactly this layout.
@@ -219,7 +317,7 @@ impl Region {
             return Err(Error::Invalid(format!("cannot allocate {len} bytes")));
         }
         Ok(Self::from_parts(
-            MemoryKind::Host,
+            Location::HOST,
             ptr as usize,
             len,
             Backing::Host(layout),
@@ -229,11 +327,12 @@ impl Region {
     /// Wrap memory owned elsewhere. `keepalive` is dropped when the region is released.
     ///
     /// # Safety
-    /// For host kinds, `addr..addr+len` must be valid, writable memory that stays alive as long
-    /// as `keepalive`, and nothing else may access it while the region is lent. For other kinds
-    /// `addr` is opaque to this crate and interpreted only by engines serving that kind.
+    /// For local host locations, `addr..addr+len` must be valid, writable memory that stays
+    /// alive as long as `keepalive`, and nothing else may access it while the region is lent.
+    /// Otherwise `addr` is opaque to this crate and interpreted only by engines serving the
+    /// location.
     pub unsafe fn external(
-        kind: MemoryKind,
+        location: Location,
         addr: usize,
         len: usize,
         keepalive: Option<Box<dyn Any + Send + Sync>>,
@@ -241,35 +340,43 @@ impl Region {
         if len == 0 {
             return invalid("region length must be positive");
         }
-        if kind.is_host() && addr == 0 {
+        if location.kind.is_host() && location.node.is_none() && addr == 0 {
             return invalid("host region address must be non-null");
         }
         Ok(Self::from_parts(
-            kind,
+            location,
             addr,
             len,
             Backing::External(keepalive),
         ))
     }
 
-    fn from_parts(kind: MemoryKind, addr: usize, len: usize, backing: Backing) -> Region {
+    fn from_parts(location: Location, addr: usize, len: usize, backing: Backing) -> Region {
         Region {
             shared: Arc::new(Shared {
-                kind,
+                location,
                 addr,
                 len,
                 backing,
                 state: Mutex::new(State {
-                    phase: Phase::Owned,
+                    owned: true,
                     holders: 0,
+                    inflight: Vec::new(),
+                    done: false,
+                    uncertain: false,
                 }),
             }),
         }
     }
 
-    /// Memory tier.
+    /// Location.
+    pub fn location(&self) -> Location {
+        self.shared.location
+    }
+
+    /// Memory kind (tier).
     pub fn kind(&self) -> MemoryKind {
-        self.shared.kind
+        self.shared.location.kind
     }
 
     /// Length in bytes.
@@ -287,25 +394,27 @@ impl Region {
         self.shared.addr
     }
 
-    /// Host bytes, or `None` for non-host kinds.
+    fn local_host(&self) -> bool {
+        self.kind().is_host() && self.location().node.is_none()
+    }
+
+    /// Host bytes, or `None` unless the region is local host memory.
     pub fn as_slice(&self) -> Option<&[u8]> {
         // SAFETY: the owner has exclusive access (see `external`'s contract).
-        self.kind()
-            .is_host()
+        self.local_host()
             .then(|| unsafe { std::slice::from_raw_parts(self.addr() as *const u8, self.len()) })
     }
 
-    /// Mutable host bytes, or `None` for non-host kinds.
+    /// Mutable host bytes, or `None` unless the region is local host memory.
     pub fn as_mut_slice(&mut self) -> Option<&mut [u8]> {
         // SAFETY: `&mut self` on the unique owner.
-        self.kind()
-            .is_host()
+        self.local_host()
             .then(|| unsafe { std::slice::from_raw_parts_mut(self.addr() as *mut u8, self.len()) })
     }
 
     /// Lend the region out (Owned -> Lent). Get it back with [`Lent::reclaim`].
     pub fn lend(self) -> Lent {
-        self.shared.state().phase = Phase::Lent;
+        self.shared.state().owned = false;
         Lent {
             shared: self.shared,
         }
@@ -314,7 +423,7 @@ impl Region {
 
 impl fmt::Debug for Region {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Region({}, {} bytes)", self.kind(), self.len())
+        write!(f, "Region({}, {} bytes)", self.location(), self.len())
     }
 }
 
@@ -338,9 +447,14 @@ pub struct Lent {
 }
 
 impl Lent {
-    /// Memory tier.
+    /// Location.
+    pub fn location(&self) -> Location {
+        self.shared.location
+    }
+
+    /// Memory kind (tier).
     pub fn kind(&self) -> MemoryKind {
-        self.shared.kind
+        self.shared.location.kind
     }
 
     /// Length in bytes.
@@ -355,7 +469,7 @@ impl Lent {
 
     /// Current phase.
     pub fn phase(&self) -> Phase {
-        self.shared.state().phase
+        self.shared.state().phase()
     }
 
     /// A shared reference for transfers, sessions and registries.
@@ -378,7 +492,7 @@ impl Lent {
     fn reclaim_inner(self, quiesced: bool) -> std::result::Result<Region, Reclaim> {
         let error = {
             let mut st = self.shared.state();
-            let error = match (st.holders, st.phase) {
+            let error = match (st.holders, st.phase()) {
                 (0, Phase::Lent | Phase::Done) => None,
                 (0, Phase::Uncertain) if quiesced => None,
                 (0, Phase::Uncertain) => Some(Error::State(
@@ -390,7 +504,13 @@ impl Lent {
                 ))),
             };
             if error.is_none() {
-                st.phase = Phase::Owned;
+                *st = State {
+                    owned: true,
+                    holders: 0,
+                    inflight: Vec::new(),
+                    done: false,
+                    uncertain: false,
+                };
             }
             error
         };
@@ -408,7 +528,7 @@ impl fmt::Debug for Lent {
         write!(
             f,
             "Lent({}, {} bytes, {})",
-            self.kind(),
+            self.location(),
             self.len(),
             self.phase().as_str()
         )
@@ -426,9 +546,14 @@ impl RegionRef {
         RegionRef { shared }
     }
 
-    /// Memory tier.
+    /// Location.
+    pub fn location(&self) -> Location {
+        self.shared.location
+    }
+
+    /// Memory kind (tier).
     pub fn kind(&self) -> MemoryKind {
-        self.shared.kind
+        self.shared.location.kind
     }
 
     /// Length in bytes.
@@ -448,7 +573,7 @@ impl RegionRef {
 
     /// Current phase.
     pub fn phase(&self) -> Phase {
-        self.shared.state().phase
+        self.shared.state().phase()
     }
 
     /// The keepalive object of an external region (engines downcast it, e.g. to a tensor).
@@ -464,41 +589,52 @@ impl RegionRef {
         Arc::ptr_eq(&self.shared, &other.shared)
     }
 
-    /// Lent | Done -> InFlight.
-    pub(crate) fn begin(&self) -> Result<Phase> {
+    /// Claim byte ranges `[start, end)` for copy `job`. Fails with `Busy` if any range overlaps
+    /// a range of another unfenced copy, and with `State` if the region is owned or uncertain;
+    /// either way nothing changes.
+    pub(crate) fn begin(&self, job: u64, ranges: &[(u64, u64)]) -> Result<()> {
         let mut st = self.shared.state();
-        match st.phase {
-            Phase::Lent | Phase::Done => {
-                let prev = st.phase;
-                st.phase = Phase::InFlight;
-                Ok(prev)
-            }
-            Phase::InFlight => Err(Error::State("region already has a copy in flight".into())),
-            Phase::Uncertain => Err(Error::State(
-                "region is uncertain; quiesce before reuse".into(),
-            )),
-            Phase::Owned => Err(Error::State("region is not lent".into())),
+        if st.owned {
+            return Err(Error::State("region is not lent".into()));
         }
+        if st.uncertain {
+            return Err(Error::State(
+                "region is uncertain; quiesce before reuse".into(),
+            ));
+        }
+        for &(a, b) in ranges {
+            if let Some(&(_, c, d)) = st.inflight.iter().find(|&&(_, c, d)| a < d && c < b) {
+                return Err(Error::Busy(format!(
+                    "bytes {a}..{b} overlap bytes {c}..{d} of an unfenced copy on this region"
+                )));
+            }
+        }
+        st.inflight.extend(ranges.iter().map(|&(a, b)| (job, a, b)));
+        Ok(())
     }
 
     /// Undo a `begin` when submission is rejected before reaching the engine.
-    pub(crate) fn rollback(&self, prev: Phase) {
-        self.shared.state().phase = prev;
+    pub(crate) fn rollback(&self, job: u64) {
+        self.shared.state().inflight.retain(|r| r.0 != job);
     }
 
-    /// InFlight -> Done | Uncertain.
-    pub(crate) fn end(&self, ok: bool) {
+    /// Copy `job` finished: release its ranges; a failure taints the whole region.
+    pub(crate) fn end(&self, job: u64, ok: bool) {
         let mut st = self.shared.state();
-        if st.phase == Phase::InFlight {
-            st.phase = if ok { Phase::Done } else { Phase::Uncertain };
+        st.inflight.retain(|r| r.0 != job);
+        if !ok {
+            st.uncertain = true;
+        } else if st.inflight.is_empty() {
+            st.done = true;
         }
     }
 
     /// Uncertain -> Lent after a quiesce.
     pub(crate) fn settle(&self, _proof: &Quiesced) {
         let mut st = self.shared.state();
-        if st.phase == Phase::Uncertain {
-            st.phase = Phase::Lent;
+        if st.uncertain {
+            st.uncertain = false;
+            st.done = false;
         }
     }
 }
@@ -520,7 +656,7 @@ impl fmt::Debug for RegionRef {
         write!(
             f,
             "RegionRef({}, {} bytes, {})",
-            self.kind(),
+            self.location(),
             self.len(),
             self.phase().as_str()
         )
@@ -534,8 +670,8 @@ pub struct RegionDesc {
     pub registry: u64,
     /// Region id within that registry.
     pub region: u64,
-    /// Memory tier.
-    pub kind: MemoryKind,
+    /// Where the region lives.
+    pub location: Location,
     /// Length in bytes.
     pub len: u64,
 }
@@ -633,7 +769,7 @@ impl Registry {
         RegionDesc {
             registry: self.id(),
             region: id,
-            kind: region.kind(),
+            location: region.location(),
             len: region.len() as u64,
         }
     }
@@ -677,8 +813,8 @@ impl Registry {
         let r = regions
             .get(&desc.region)
             .ok_or_else(|| Error::Invalid("descriptor names an unregistered region".into()))?;
-        if r.kind() != desc.kind || r.len() as u64 != desc.len {
-            return invalid("descriptor kind/length differ from the registered region");
+        if r.location() != desc.location || r.len() as u64 != desc.len {
+            return invalid("descriptor location/length differ from the registered region");
         }
         Ok(r.clone())
     }
@@ -716,11 +852,9 @@ mod tests {
             }
             Ok(_) => panic!("reclaimed while referenced"),
         };
-        // Lent -> InFlight -> Done, then reclaim once the reference is gone.
-        let prev = r.begin().unwrap();
-        assert_eq!(prev, Phase::Lent);
-        assert!(r.begin().is_err(), "single copy in flight per region");
-        r.end(true);
+        r.begin(1, &[(0, 16)]).unwrap();
+        assert_eq!(lent.phase(), Phase::InFlight);
+        r.end(1, true);
         assert_eq!(lent.phase(), Phase::Done);
         drop(r);
         let region = lent.reclaim().unwrap();
@@ -728,30 +862,67 @@ mod tests {
     }
 
     #[test]
-    fn uncertain_needs_quiesce() {
-        let lent = Region::host(16).unwrap().lend();
+    fn disjoint_ranges_run_concurrently_overlaps_are_busy() {
+        let lent = Region::host(64).unwrap().lend();
         let r = lent.share();
-        r.begin().unwrap();
-        r.end(false);
+        r.begin(1, &[(0, 16), (32, 40)]).unwrap();
+        r.begin(2, &[(16, 32)]).unwrap();
+        // Overlap with job 1: rejected, and job 3 claims nothing (not even its free range).
+        assert!(matches!(
+            r.begin(3, &[(48, 64), (39, 41)]),
+            Err(Error::Busy(_))
+        ));
+        r.begin(4, &[(48, 64)]).unwrap();
+        r.end(1, true);
+        r.end(2, true);
+        assert_eq!(r.phase(), Phase::InFlight);
+        r.end(4, true);
+        assert_eq!(r.phase(), Phase::Done);
+        r.begin(5, &[(0, 64)]).unwrap();
+        r.rollback(5);
+        assert_eq!(r.phase(), Phase::Done);
+    }
+
+    #[test]
+    fn uncertain_taints_whole_region_until_quiesce() {
+        let lent = Region::host(64).unwrap().lend();
+        let r = lent.share();
+        r.begin(1, &[(0, 8)]).unwrap();
+        r.begin(2, &[(8, 16)]).unwrap();
+        r.end(1, false);
         assert_eq!(r.phase(), Phase::Uncertain);
         assert!(
-            r.begin().is_err(),
-            "uncertain regions are never resubmitted"
+            r.begin(3, &[(32, 40)]).is_err(),
+            "disjoint bytes are tainted too"
         );
+        r.end(2, true);
+        assert_eq!(r.phase(), Phase::Uncertain);
         drop(r);
         let lent = lent.reclaim().unwrap_err().lent;
         let proof = Quiesced::new();
         let region = lent.reclaim_quiesced(&proof).unwrap();
-        assert_eq!(region.len(), 16);
+        assert_eq!(region.len(), 64);
     }
 
     #[test]
     fn owned_region_cannot_start_a_copy() {
-        let region = Region::host(8).unwrap();
-        let lent = region.lend();
+        let lent = Region::host(8).unwrap().lend();
         let r = lent.share();
         r.settle(&Quiesced::new()); // no-op unless uncertain
         assert_eq!(r.phase(), Phase::Lent);
+    }
+
+    #[test]
+    fn locations_parse_and_print() {
+        let l: Location = "rngd:3".parse().unwrap();
+        assert_eq!(l, Location::new(MemoryKind::Rngd, 3));
+        assert_eq!("host".parse::<Location>().unwrap(), Location::HOST);
+        let remote: Location = "atom:2@17".parse().unwrap();
+        assert_eq!(remote, Location::new(MemoryKind::Atom, 2).on_node(17));
+        assert_eq!(remote.to_string(), "atom:2@17");
+        for bad in ["gpu:0", "cuda:x", "cuda:0@", "cuda:-1"] {
+            assert!(bad.parse::<Location>().is_err(), "{bad}");
+        }
     }
 
     #[test]

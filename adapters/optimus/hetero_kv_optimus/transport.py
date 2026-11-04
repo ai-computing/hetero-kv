@@ -56,15 +56,17 @@ class TransferPlan:
 
 class SessionTransport:
     """Replacement for ``hetero_p2p.HeteroP2PTransport``: an explicit route over any hetero-kv
-    engine. ``plan_builder(source_lease, destination_lease) -> TransferPlan`` must use live,
+    engine between two device locations (e.g. ``src_location="rngd:3"``,
+    ``dst_location="atom:2"``). ``plan_builder(source_lease, destination_lease) -> TransferPlan`` must use live,
     owned allocations; ``notify(destination_lease)`` makes the fenced cache visible to the
     decoder. Session states map to the old ``CopySession`` ones as fenced = ready,
     admitted = decoding."""
 
     def __init__(self, engine, plan_builder: Callable[[Any, Any], TransferPlan], notify: Callable[[Any], Any],
-                 *, source: str, destination: str, spec, src_kind: str = "host", dst_kind: str = "host"):
+                 *, source: str, destination: str, spec, src_location: str = "host",
+                 dst_location: str = "host"):
         self.representation = hk.canonical_representation(spec.representation)
-        self.session = hk.Session(engine, src_kind, dst_kind, self.representation)
+        self.session = hk.Session(hk.Route(engine, src_location, dst_location, self.representation))
         self.plan_builder, self.notify = plan_builder, notify
         self.source, self.destination, self.spec = source, destination, spec
 
@@ -128,9 +130,6 @@ def _groups(manager, spec):
     return groups, chunks[0][0][0]
 
 
-_KIND = {"cpu": "host", "cuda": "cuda"}
-
-
 class TorchCacheTransport:
     """Replacement for ``torch_cache.TorchCacheTransport``: explicit tensor-copy transport,
     never selected as a P2P fallback. Copies the source prefix ``[0, seq_len)`` of every layer
@@ -145,12 +144,12 @@ class TorchCacheTransport:
     def supports(self, source, destination, spec):
         return (source, destination, spec) == (self.source, self.destination, self.spec)
 
-    def _session(self, src_kind, dst_kind, representation):
+    def _session(self, src_location, dst_location, representation):
         from hetero_kv.torch_engine import TorchCopyEngine
 
-        key = (src_kind, dst_kind, representation)
+        key = (src_location, dst_location, representation)
         if key not in self._sessions:
-            self._sessions[key] = hk.Session(TorchCopyEngine(), *key)
+            self._sessions[key] = hk.Session(hk.Route(TorchCopyEngine(), *key))
         return self._sessions[key]
 
     def transfer(self, request_id, source, destination):
@@ -164,17 +163,19 @@ class TorchCacheTransport:
         dst_groups, dst_t = _groups(dst, destination.spec)
         if len(src_groups) != len(dst_groups):
             raise ValueError("source and destination layer groups differ")
-        try:
-            kinds = (_KIND[src_t.device.type], _KIND[dst_t.device.type])
-        except KeyError as error:
-            raise ValueError(f"no tensor-copy route for device {error}") from None
-        session = self._session(*kinds, hk.canonical_representation(str(src_t.dtype)))
+        from hetero_kv.torch_engine import tensor_location
+
+        locations = (tensor_location(src_t.device), tensor_location(dst_t.device))
+        session = self._session(*locations, hk.canonical_representation(str(src_t.dtype)))
         batch = src_t.shape[0]
         session.reserve(request_id, dst_groups)
         try:
+            # One transfer per (group, batch entry): they touch disjoint byte ranges of the same
+            # tensors, so they are in flight together.
             for group, buf in enumerate(src_groups):
-                selections = [hk.Selection(src_blocks=(b,), dst_blocks=(b,), tokens=position) for b in range(batch)]
-                session.transfer(request_id, buf, selections, group=group)
+                for b in range(batch):
+                    session.transfer(request_id, buf, hk.Selection(src_blocks=(b,), dst_blocks=(b,), tokens=position),
+                                     group=group)
             receipt = session.fence(request_id)
             session.admit(request_id, lambda: dst.set_seq_len(position))
         except (hk.InvalidError, hk.UnsupportedError, hk.StateError):

@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use super::layout::KvSpec;
 use crate::error::{invalid, Error, Result};
-use crate::memory::{Lent, MemoryKind, Quiesced, Region, RegionDesc, RegionRef, Registry};
+use crate::memory::{
+    Lent, Location, MemoryKind, Quiesced, Region, RegionDesc, RegionRef, Registry,
+};
 
 /// Content hash of a block (e.g. vLLM's prefix-chain block hash): an integer or raw bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -27,7 +29,7 @@ pub struct BufferReclaim {
     pub error: Error,
 }
 
-/// A KV buffer: its spec and the regions the layout addresses, all of one memory kind.
+/// A KV buffer: its spec and the regions the layout addresses, all at one [`Location`].
 /// Owns the [`Lent`] handles; give it back with [`KvBuffer::reclaim`].
 pub struct KvBuffer {
     spec: KvSpec,
@@ -44,7 +46,7 @@ pub struct KvBufferRef {
 
 fn check_regions<'a>(
     spec: &KvSpec,
-    lens_kinds: impl ExactSizeIterator<Item = (usize, MemoryKind)> + 'a,
+    lens_kinds: impl ExactSizeIterator<Item = (usize, Location)> + 'a,
 ) -> Result<()> {
     let layout = &spec.layout;
     if lens_kinds.len() != layout.region_count() {
@@ -57,7 +59,7 @@ fn check_regions<'a>(
     let mut kind = None;
     for (len, k) in lens_kinds {
         if *kind.get_or_insert(k) != k {
-            return invalid("all regions of a KV buffer must be one memory kind");
+            return invalid("all regions of a KV buffer must be at one location");
         }
         if (len as u64) < layout.region_bytes() {
             return invalid(format!(
@@ -72,7 +74,7 @@ fn check_regions<'a>(
 impl KvBuffer {
     /// Check that `regions` fit `spec` without consuming them.
     pub fn validate(spec: &KvSpec, regions: &[Region]) -> Result<()> {
-        check_regions(spec, regions.iter().map(|r| (r.len(), r.kind())))
+        check_regions(spec, regions.iter().map(|r| (r.len(), r.location())))
     }
 
     /// Build a buffer, lending the regions. Regions are dropped if validation fails; call
@@ -93,6 +95,11 @@ impl KvBuffer {
     /// Memory kind of the regions.
     pub fn kind(&self) -> MemoryKind {
         self.regions[0].kind()
+    }
+
+    /// Location of the regions.
+    pub fn location(&self) -> Location {
+        self.regions[0].location()
     }
 
     /// Lent region handles (for phase inspection).
@@ -173,6 +180,11 @@ impl KvBufferRef {
         self.regions[0].kind()
     }
 
+    /// Location of the regions.
+    pub fn location(&self) -> Location {
+        self.regions[0].location()
+    }
+
     /// Region references in layout order.
     pub fn regions(&self) -> &[RegionRef] {
         &self.regions
@@ -219,7 +231,10 @@ impl KvDescriptor {
     /// Decode [`KvDescriptor::to_bytes`] and check it against its layout.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let d: KvDescriptor = crate::wire::decode("kv_buffer", bytes)?;
-        check_regions(&d.spec, d.regions.iter().map(|r| (r.len as usize, r.kind)))?;
+        check_regions(
+            &d.spec,
+            d.regions.iter().map(|r| (r.len as usize, r.location)),
+        )?;
         Ok(d)
     }
 

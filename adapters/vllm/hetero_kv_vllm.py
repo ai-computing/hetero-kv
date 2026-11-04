@@ -18,9 +18,10 @@ class HeteroKVConnector:
     """P/D connector. Decode side pulls (``direction="read"``, like NixlConnector); the producer
     can also push (``"write"``) when the decode side exported its blocks first."""
 
-    def __init__(self, engine_id: str, engine, representation: str, src_kind="cuda", dst_kind="cuda"):
+    def __init__(self, engine_id: str, engine, representation: str, src="cuda:0", dst="cuda:0"):
         self.agent = hk.Agent(engine_id)
-        self.session_args = (engine, src_kind, dst_kind, representation)
+        # One shared route for the worker; one cheap Session per request (many in flight).
+        self.route = hk.Route(engine, src, dst, representation)
         self.buffer: hk.KVBuffer | None = None
         self.sessions: dict[str, hk.Session] = {}
 

@@ -2,13 +2,18 @@
 //! transfer handles that drive the L1 ownership state machine.
 //!
 //! An engine copies byte spans between regions. It never chooses a route: callers select a
-//! [`Route`] for `(source kind, destination kind, representation)` and selection fails with
-//! [`Error::Unsupported`] if the engine does not advertise that triple. There is no fallback.
+//! [`Route`] for `(source location, destination location, source representation, destination
+//! representation)` and selection fails with [`Error::Unsupported`] if the engine does not
+//! advertise it. There is no fallback. A route whose representations differ converts on the way
+//! (e.g. BF16 -> DLFloat16 for RNGD -> ATOM); P0 engines declare identity routes only.
+//!
+//! A [`Route`] is cheap to clone and `Send + Sync`: one engine serves many sessions at once.
 
 mod host;
 
 use std::fmt;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -16,7 +21,7 @@ use serde::{Deserialize, Serialize};
 pub use host::HostEngine;
 
 use crate::error::{invalid, Error, Result};
-use crate::memory::{MemoryKind, Phase, Quiesced, RegionRef};
+use crate::memory::{Location, MemoryKind, Quiesced, RegionRef};
 
 /// Physical element encoding of KV data. Distinct values never alias: BF16, FP16 and
 /// DLFloat16 are all 2 bytes but are not interchangeable.
@@ -41,6 +46,11 @@ impl Representation {
         Representation::Dlfloat16,
         Representation::Fp32,
     ];
+
+    /// Bytes of `to` holding the elements of `len` bytes of `self`.
+    pub fn convert_len(self, len: u64, to: Representation) -> u64 {
+        len / self.element_bytes() * to.element_bytes()
+    }
 
     /// Bytes per element.
     pub fn element_bytes(self) -> u64 {
@@ -114,8 +124,9 @@ impl FromStr for Direction {
     }
 }
 
-/// One contiguous copy: `len` bytes from `src[src]` at `src_offset` to `dst[dst]` at
-/// `dst_offset`, where `src`/`dst` index the region lists of a job.
+/// One contiguous copy: `len` source bytes from `src[src]` at `src_offset` to `dst[dst]` at
+/// `dst_offset`, where `src`/`dst` index the region lists of a job. On a converting route the
+/// destination range is `CopyJob::dst_len(len)` bytes long.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Span {
     /// Index into the job's source regions.
@@ -126,7 +137,7 @@ pub struct Span {
     pub dst: u32,
     /// Byte offset in that destination region.
     pub dst_offset: u64,
-    /// Length in bytes (positive).
+    /// Source length in bytes (positive, whole source elements).
     pub len: u64,
 }
 
@@ -138,16 +149,24 @@ pub struct CopyJob<'a> {
     pub dst: &'a [RegionRef],
     /// Byte spans; destinations never overlap.
     pub spans: &'a [Span],
-    /// Element encoding of the bytes (engines may refuse or convert per their capabilities).
+    /// Element encoding of the source bytes.
     pub representation: Representation,
+    /// Element encoding to write (differs only on converting routes).
+    pub dst_representation: Representation,
     /// Push or pull.
     pub direction: Direction,
 }
 
 impl CopyJob<'_> {
-    /// Total bytes the job moves.
+    /// Total source bytes the job reads; completions report this number.
     pub fn bytes(&self) -> u64 {
         self.spans.iter().map(|s| s.len).sum()
+    }
+
+    /// Destination bytes written for `len` source bytes.
+    pub fn dst_len(&self, len: u64) -> u64 {
+        self.representation
+            .convert_len(len, self.dst_representation)
     }
 }
 
@@ -155,7 +174,7 @@ impl CopyJob<'_> {
 pub trait Completion: Send {
     /// Non-blocking check. `Ok(Some(bytes))` once complete.
     fn poll(&mut self) -> Result<Option<u64>>;
-    /// Block until complete; returns the number of bytes the engine verified as copied.
+    /// Block until complete; returns the number of source bytes the engine verified as copied.
     fn wait(&mut self) -> Result<u64>;
 }
 
@@ -173,10 +192,84 @@ pub trait CopyEngine: Send + Sync {
     fn quiesce(&self) -> Result<()>;
 }
 
-/// Capability matrix: the `(source kind, destination kind, representation)` triples served.
+/// Devices an engine serves: one memory kind, and either one device index or all of them.
+/// Written `kind` or `kind:*` (any index) and `kind:index`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DevicePattern {
+    /// Memory kind.
+    pub kind: MemoryKind,
+    /// `None` matches every device index of the kind.
+    pub index: Option<u32>,
+}
+
+impl DevicePattern {
+    /// Every device of `kind`.
+    pub const fn any(kind: MemoryKind) -> Self {
+        DevicePattern { kind, index: None }
+    }
+
+    /// Device `index` of `kind`.
+    pub const fn at(kind: MemoryKind, index: u32) -> Self {
+        DevicePattern {
+            kind,
+            index: Some(index),
+        }
+    }
+
+    /// True if `loc` is one of the devices (nodes are checked by `Route::select`: P0 routes are
+    /// local only).
+    pub fn matches(&self, loc: Location) -> bool {
+        self.kind == loc.kind && self.index.is_none_or(|i| i == loc.index)
+    }
+}
+
+impl From<MemoryKind> for DevicePattern {
+    fn from(kind: MemoryKind) -> Self {
+        DevicePattern::any(kind)
+    }
+}
+
+impl fmt::Display for DevicePattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.index {
+            Some(i) => write!(f, "{}:{i}", self.kind),
+            None => write!(f, "{}:*", self.kind),
+        }
+    }
+}
+
+impl FromStr for DevicePattern {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.split_once(':') {
+            None => Ok(DevicePattern::any(s.parse()?)),
+            Some((k, "*")) => Ok(DevicePattern::any(k.parse()?)),
+            Some((k, i)) => Ok(DevicePattern::at(
+                k.parse()?,
+                i.parse()
+                    .map_err(|_| Error::Invalid(format!("bad device pattern {s:?}")))?,
+            )),
+        }
+    }
+}
+
+/// One served route: device patterns and the source -> destination representations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RouteCap {
+    /// Source devices.
+    pub src: DevicePattern,
+    /// Destination devices.
+    pub dst: DevicePattern,
+    /// Source representation.
+    pub src_repr: Representation,
+    /// Destination representation (equal to `src_repr` unless the engine converts).
+    pub dst_repr: Representation,
+}
+
+/// Capability matrix of an engine.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Capabilities {
-    routes: Vec<(MemoryKind, MemoryKind, Representation)>,
+    routes: Vec<RouteCap>,
 }
 
 impl Capabilities {
@@ -185,65 +278,119 @@ impl Capabilities {
         Self::default()
     }
 
-    /// Add a triple for each listed representation.
+    /// Identity routes (no conversion) for each listed representation.
     pub fn allow(
         mut self,
-        src: MemoryKind,
-        dst: MemoryKind,
+        src: impl Into<DevicePattern>,
+        dst: impl Into<DevicePattern>,
         representations: &[Representation],
     ) -> Self {
+        let (src, dst) = (src.into(), dst.into());
         for &r in representations {
-            if !self.supports(src, dst, r) {
-                self.routes.push((src, dst, r));
-            }
+            self = self.allow_conversion(src, dst, r, r);
         }
         self
     }
 
-    /// True if the triple is served.
-    pub fn supports(&self, src: MemoryKind, dst: MemoryKind, repr: Representation) -> bool {
-        self.routes.contains(&(src, dst, repr))
+    /// A route that converts `from` to `to` on the way.
+    pub fn allow_conversion(
+        mut self,
+        src: impl Into<DevicePattern>,
+        dst: impl Into<DevicePattern>,
+        from: Representation,
+        to: Representation,
+    ) -> Self {
+        let cap = RouteCap {
+            src: src.into(),
+            dst: dst.into(),
+            src_repr: from,
+            dst_repr: to,
+        };
+        if !self.routes.contains(&cap) {
+            self.routes.push(cap);
+        }
+        self
     }
 
-    /// All served triples.
-    pub fn routes(&self) -> &[(MemoryKind, MemoryKind, Representation)] {
+    /// True if some declared route covers this one.
+    pub fn supports(
+        &self,
+        src: Location,
+        dst: Location,
+        src_repr: Representation,
+        dst_repr: Representation,
+    ) -> bool {
+        self.routes.iter().any(|c| {
+            c.src.matches(src)
+                && c.dst.matches(dst)
+                && c.src_repr == src_repr
+                && c.dst_repr == dst_repr
+        })
+    }
+
+    /// All declared routes.
+    pub fn routes(&self) -> &[RouteCap] {
         &self.routes
     }
 }
 
-/// An explicitly selected engine route.
+/// An explicitly selected engine route between two device locations.
 #[derive(Clone)]
 pub struct Route {
     engine: Arc<dyn CopyEngine>,
-    src: MemoryKind,
-    dst: MemoryKind,
-    repr: Representation,
+    src: Location,
+    dst: Location,
+    src_repr: Representation,
+    dst_repr: Representation,
 }
 
 impl fmt::Debug for Route {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "Route({}: {} -> {}, {})",
+            "Route({}: {} -> {}, {} -> {})",
             self.engine.name(),
             self.src,
             self.dst,
-            self.repr
+            self.src_repr,
+            self.dst_repr
         )
     }
 }
 
+/// Ids of submitted jobs, unique per process (they key byte-range claims on regions).
+static NEXT_JOB: AtomicU64 = AtomicU64::new(1);
+
 impl Route {
-    /// Select a route. Fails with [`Error::Unsupported`] if the engine does not serve it.
+    /// Select an identity route (no conversion). Fails with [`Error::Unsupported`] if the
+    /// engine does not serve it.
     pub fn select(
         engine: Arc<dyn CopyEngine>,
-        src: MemoryKind,
-        dst: MemoryKind,
+        src: impl Into<Location>,
+        dst: impl Into<Location>,
         repr: Representation,
     ) -> Result<Route> {
-        if !engine.capabilities().supports(src, dst, repr) {
+        Self::select_converting(engine, src, dst, repr, repr)
+    }
+
+    /// Select a route that writes `dst_repr` from `src_repr` data. Fails with
+    /// [`Error::Unsupported`] unless the engine declared exactly this conversion.
+    pub fn select_converting(
+        engine: Arc<dyn CopyEngine>,
+        src: impl Into<Location>,
+        dst: impl Into<Location>,
+        src_repr: Representation,
+        dst_repr: Representation,
+    ) -> Result<Route> {
+        let (src, dst) = (src.into(), dst.into());
+        if src.node.is_some() || dst.node.is_some() {
             return Err(Error::Unsupported(format!(
-                "engine {} has no route {src} -> {dst} for {repr}",
+                "route {src} -> {dst} involves another node; network engines arrive in phase P3"
+            )));
+        }
+        if !engine.capabilities().supports(src, dst, src_repr, dst_repr) {
+            return Err(Error::Unsupported(format!(
+                "engine {} has no route {src} -> {dst} for {src_repr} -> {dst_repr}",
                 engine.name()
             )));
         }
@@ -251,21 +398,30 @@ impl Route {
             engine,
             src,
             dst,
-            repr,
+            src_repr,
+            dst_repr,
         })
     }
 
-    /// Source memory kind.
-    pub fn src(&self) -> MemoryKind {
+    /// Source location.
+    pub fn src(&self) -> Location {
         self.src
     }
-    /// Destination memory kind.
-    pub fn dst(&self) -> MemoryKind {
+    /// Destination location.
+    pub fn dst(&self) -> Location {
         self.dst
     }
-    /// Representation.
+    /// Source representation.
     pub fn representation(&self) -> Representation {
-        self.repr
+        self.src_repr
+    }
+    /// Destination representation.
+    pub fn dst_representation(&self) -> Representation {
+        self.dst_repr
+    }
+    /// True if the route converts representations.
+    pub fn converts(&self) -> bool {
+        self.src_repr != self.dst_repr
     }
     /// Engine name.
     pub fn engine_name(&self) -> &str {
@@ -282,39 +438,40 @@ impl Route {
         direction: Direction,
     ) -> Result<Transfer> {
         self.validate(src, dst, spans)?;
-        // Mark every distinct region a span touches InFlight, rolling back if one is
-        // unavailable. Untouched regions of the same buffers stay free for other transfers
-        // (e.g. other layers of a layer-streamed request).
-        let mut regions: Vec<RegionRef> = Vec::new();
+        // Claim the byte ranges every span touches, per distinct region. Disjoint claims of
+        // other jobs on the same regions are fine; an overlap rejects the whole job unchanged.
+        let mut claims: Vec<(RegionRef, Vec<(u64, u64)>)> = Vec::new();
+        let mut claim =
+            |r: &RegionRef, a: u64, len: u64| match claims.iter_mut().find(|(x, _)| x.same(r)) {
+                Some((_, ranges)) => ranges.push((a, a + len)),
+                None => claims.push((r.clone(), vec![(a, a + len)])),
+            };
         for s in spans {
-            for r in [&src[s.src as usize], &dst[s.dst as usize]] {
-                if !regions.iter().any(|x| x.same(r)) {
-                    regions.push(r.clone());
+            claim(&src[s.src as usize], s.src_offset, s.len);
+            claim(&dst[s.dst as usize], s.dst_offset, self.dst_len(s.len));
+        }
+        let id = NEXT_JOB.fetch_add(1, Ordering::Relaxed);
+        for (i, (r, ranges)) in claims.iter().enumerate() {
+            if let Err(e) = r.begin(id, ranges) {
+                for (r, _) in &claims[..i] {
+                    r.rollback(id);
                 }
+                return Err(e);
             }
         }
-        let mut started: Vec<(usize, Phase)> = Vec::new();
-        for (i, r) in regions.iter().enumerate() {
-            match r.begin() {
-                Ok(prev) => started.push((i, prev)),
-                Err(e) => {
-                    for (j, prev) in started {
-                        regions[j].rollback(prev);
-                    }
-                    return Err(e);
-                }
-            }
-        }
+        let regions = claims.into_iter().map(|(r, _)| r).collect();
         let job = CopyJob {
             src,
             dst,
             spans,
-            representation: self.repr,
+            representation: self.src_repr,
+            dst_representation: self.dst_repr,
             direction,
         };
         let bytes = job.bytes();
-        // From here on the transfer owns the regions' fate: drop or failure means Uncertain.
+        // From here on the transfer owns the claims' fate: drop or failure means Uncertain.
         let mut transfer = Transfer {
+            id,
             completion: None,
             regions,
             bytes,
@@ -333,15 +490,19 @@ impl Route {
         }
     }
 
+    fn dst_len(&self, len: u64) -> u64 {
+        self.src_repr.convert_len(len, self.dst_repr)
+    }
+
     fn validate(&self, src: &[RegionRef], dst: &[RegionRef], spans: &[Span]) -> Result<()> {
         if spans.is_empty() {
             return invalid("empty copy plan");
         }
-        for (side, regions, kind) in [("source", src, self.src), ("destination", dst, self.dst)] {
-            if let Some(r) = regions.iter().find(|r| r.kind() != kind) {
+        for (side, regions, loc) in [("source", src, self.src), ("destination", dst, self.dst)] {
+            if let Some(r) = regions.iter().find(|r| r.location() != loc) {
                 return Err(Error::Unsupported(format!(
-                    "{side} region is {} but the route expects {kind}",
-                    r.kind()
+                    "{side} region is at {} but the route expects {loc}",
+                    r.location()
                 )));
             }
         }
@@ -350,13 +511,18 @@ impl Route {
             let (Some(a), Some(b)) = (src.get(s.src as usize), dst.get(s.dst as usize)) else {
                 return invalid("span names an unknown region");
             };
-            let in_bounds =
-                |off: u64, len: usize| off.checked_add(s.len).is_some_and(|end| end <= len as u64);
-            if s.len == 0 || !in_bounds(s.src_offset, a.len()) || !in_bounds(s.dst_offset, b.len())
+            let dst_len = self.dst_len(s.len);
+            let in_bounds = |off: u64, n: u64, len: usize| {
+                off.checked_add(n).is_some_and(|end| end <= len as u64)
+            };
+            if s.len == 0
+                || s.len % self.src_repr.element_bytes() != 0
+                || !in_bounds(s.src_offset, s.len, a.len())
+                || !in_bounds(s.dst_offset, dst_len, b.len())
             {
-                return invalid("span is empty or outside its region");
+                return invalid("span is empty, splits an element, or lies outside its region");
             }
-            writes.push((s.dst as usize, s.dst_offset, s.dst_offset + s.len));
+            writes.push((s.dst as usize, s.dst_offset, s.dst_offset + dst_len));
         }
         // Destinations must not overlap, including two indices naming the same region.
         let key = |i: usize| dst.iter().position(|r| r.same(&dst[i])).unwrap_or(i);
@@ -385,9 +551,10 @@ enum Outcome {
     Failed(String),
 }
 
-/// Handle to a submitted job. Regions stay `InFlight` until it completes; dropping it before
-/// completion marks them `Uncertain` (the engine may still be copying).
+/// Handle to a submitted job. Its byte ranges stay claimed (`InFlight`) until it completes;
+/// dropping it before completion marks its regions `Uncertain` (the engine may still be copying).
 pub struct Transfer {
+    id: u64,
     completion: Option<Box<dyn Completion>>,
     regions: Vec<RegionRef>,
     bytes: u64,
@@ -402,7 +569,7 @@ impl fmt::Debug for Transfer {
 }
 
 impl Transfer {
-    /// Planned bytes.
+    /// Planned source bytes.
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
@@ -458,7 +625,7 @@ impl Transfer {
         self.completion = None;
         self.outcome = Outcome::Done;
         for r in &self.regions {
-            r.end(true);
+            r.end(self.id, true);
         }
         Ok(self.bytes)
     }
@@ -467,7 +634,7 @@ impl Transfer {
         self.completion = None;
         self.outcome = Outcome::Failed(msg.clone());
         for r in &self.regions {
-            r.end(false);
+            r.end(self.id, false);
         }
         Error::Transfer(msg)
     }
@@ -484,7 +651,7 @@ impl Drop for Transfer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{Lent, Region};
+    use crate::memory::{Lent, Phase, Region};
     use std::sync::Mutex;
 
     fn host_pair(n: usize) -> (Lent, Lent) {
@@ -515,9 +682,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(e, Error::Unsupported(_)));
+        let h = Location::HOST;
         assert!(Capabilities::new()
             .allow(MemoryKind::Host, MemoryKind::Host, &[Representation::Fp16])
-            .supports(MemoryKind::Host, MemoryKind::Host, Representation::Fp16));
+            .supports(h, h, Representation::Fp16, Representation::Fp16));
     }
 
     #[test]
@@ -591,11 +759,110 @@ mod tests {
             .unwrap_err();
         assert!(e.is_rejection());
         // Kind mismatch against the route.
-        let cuda = unsafe { Region::external(MemoryKind::Cuda, 1, 64, None).unwrap() }.lend();
+        let cuda =
+            unsafe { Region::external(Location::new(MemoryKind::Cuda, 0), 1, 64, None).unwrap() }
+                .lend();
         let e = route
             .submit(&[a.share()], &[cuda.share()], &[ok], Direction::Write)
             .unwrap_err();
         assert!(matches!(e, Error::Unsupported(_)));
+    }
+
+    #[test]
+    fn disjoint_jobs_share_a_region_overlaps_are_rejected_unchanged() {
+        let (a, b) = host_pair(64);
+        let caps =
+            Capabilities::new().allow(MemoryKind::Host, MemoryKind::Host, &Representation::ALL);
+        let route = Route::select(
+            Arc::new(Scripted {
+                caps,
+                result: Mutex::new(None),
+                quiesce_ok: true,
+            }),
+            MemoryKind::Host,
+            MemoryKind::Host,
+            Representation::Bf16,
+        )
+        .unwrap();
+        let span = |off: u64| Span {
+            src: 0,
+            src_offset: off,
+            dst: 0,
+            dst_offset: off,
+            len: 16,
+        };
+        let (sa, sb) = (&[a.share()], &[b.share()]);
+        let mut t1 = route.submit(sa, sb, &[span(0)], Direction::Write).unwrap();
+        let mut t2 = route.submit(sa, sb, &[span(16)], Direction::Write).unwrap();
+        let e = route
+            .submit(sa, sb, &[span(32), span(8)], Direction::Write)
+            .unwrap_err();
+        assert!(matches!(e, Error::Busy(_)));
+        // Nothing of the rejected job was claimed: its free range is still available.
+        let mut t3 = route.submit(sa, sb, &[span(32)], Direction::Write).unwrap();
+        for t in [&mut t1, &mut t2] {
+            t.wait().unwrap();
+        }
+        assert_eq!(b.phase(), Phase::InFlight);
+        t3.wait().unwrap();
+        assert_eq!(b.phase(), Phase::Done);
+    }
+
+    #[test]
+    fn device_indices_and_conversions_are_explicit() {
+        let caps = Capabilities::new()
+            .allow(MemoryKind::Cuda, MemoryKind::Cuda, &[Representation::Bf16])
+            .allow_conversion(
+                DevicePattern::at(MemoryKind::Rngd, 3),
+                DevicePattern::any(MemoryKind::Atom),
+                Representation::Bf16,
+                Representation::Dlfloat16,
+            );
+        let engine: Arc<dyn CopyEngine> = Arc::new(Scripted {
+            caps,
+            result: Mutex::new(None),
+            quiesce_ok: true,
+        });
+        let loc = |s: &str| s.parse::<Location>().unwrap();
+        let bf16 = Representation::Bf16;
+        let dlf = Representation::Dlfloat16;
+        assert!(Route::select(engine.clone(), loc("cuda:0"), loc("cuda:1"), bf16).is_ok());
+        let r = Route::select_converting(engine.clone(), loc("rngd:3"), loc("atom:2"), bf16, dlf)
+            .unwrap();
+        assert!(r.converts() && r.dst() == loc("atom:2"));
+        // Not declared: other RNGD device, identity on the converting pair, reverse conversion.
+        for (src, dst, a, b) in [
+            ("rngd:0", "atom:2", bf16, dlf),
+            ("rngd:3", "atom:2", bf16, bf16),
+            ("rngd:3", "atom:2", dlf, bf16),
+        ] {
+            let e = Route::select_converting(engine.clone(), loc(src), loc(dst), a, b).unwrap_err();
+            assert!(matches!(e, Error::Unsupported(_)));
+        }
+        // Cross-node routes need a network engine.
+        let e = Route::select(engine.clone(), loc("cuda:0"), loc("cuda:0@7"), bf16).unwrap_err();
+        assert!(matches!(e, Error::Unsupported(_)));
+        // A region on another device of the same kind does not fit the route.
+        let (a, _) = host_pair(8);
+        let r01 = Route::select(engine, loc("cuda:0"), loc("cuda:1"), bf16).unwrap();
+        let wrong = unsafe { Region::external(loc("cuda:2"), 1, 64, None).unwrap() }.lend();
+        let src = unsafe { Region::external(loc("cuda:0"), 1, 64, None).unwrap() }.lend();
+        let span = Span {
+            src: 0,
+            src_offset: 0,
+            dst: 0,
+            dst_offset: 0,
+            len: 8,
+        };
+        let e = r01
+            .submit(&[src.share()], &[wrong.share()], &[span], Direction::Write)
+            .unwrap_err();
+        assert!(matches!(e, Error::Unsupported(_)));
+        drop(a);
+        assert_eq!(
+            "cuda:*".parse::<DevicePattern>().unwrap(),
+            DevicePattern::any(MemoryKind::Cuda)
+        );
     }
 
     /// An engine whose completions are controlled by the test.
@@ -620,9 +887,11 @@ mod tests {
         fn capabilities(&self) -> &Capabilities {
             &self.caps
         }
-        fn submit(&self, _job: &CopyJob<'_>) -> Result<Box<dyn Completion>> {
+        fn submit(&self, job: &CopyJob<'_>) -> Result<Box<dyn Completion>> {
+            // No scripted result: complete honestly with the job's byte count.
             match self.result.lock().unwrap().take() {
                 Some(Err(e)) if e.is_rejection() => Err(Error::Transfer(e.to_string())),
+                None => Ok(Box::new(ScriptedCompletion(Some(Ok(job.bytes()))))),
                 r => Ok(Box::new(ScriptedCompletion(r))),
             }
         }

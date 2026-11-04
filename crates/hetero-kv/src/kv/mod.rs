@@ -10,7 +10,7 @@ mod progress;
 pub use buffer::{BlockHash, BufferReclaim, KvBuffer, KvBufferRef, KvDescriptor};
 pub use events::{EventLog, KvEvent, KvEventBatch};
 pub use layout::{Axis, Geometry, KvKind, KvSpec, Layout, Split, Strides, LAYOUT_VERSION};
-pub use plan::{plan, Plan, Selection};
+pub use plan::{plan, plan_converting, Plan, Selection};
 pub use progress::{LayerProgress, ProgressSpan};
 
 pub use crate::engine::Representation;

@@ -119,9 +119,20 @@ typedef enum {
 } hkv_session_state;
 
 /**
- * KV buffer handle (owns its regions while it exists).
+ * Agent handle: identity, registration and descriptors.
+ */
+typedef struct hkv_agent hkv_agent;
+
+/**
+ * KV buffer handle: an owned buffer (owns its regions) or a reference resolved from a
+ * descriptor (cannot be reclaimed).
  */
 typedef struct hkv_buffer hkv_buffer;
+
+/**
+ * Serializable KV buffer descriptor.
+ */
+typedef struct hkv_descriptor hkv_descriptor;
 
 /**
  * Copy engine handle.
@@ -147,6 +158,19 @@ typedef struct hkv_session hkv_session;
  * KV spec handle.
  */
 typedef struct hkv_spec hkv_spec;
+
+/**
+ * Where memory lives: kind, device index, and an optional node id (cross-host, later phases).
+ */
+typedef struct {
+  hkv_memory_kind kind;
+  uint32_t index;
+  /**
+   * Non-zero if `node` is set; P0 routes accept local locations only.
+   */
+  bool has_node;
+  uint64_t node;
+} hkv_location;
 
 /**
  * Logical KV geometry.
@@ -245,10 +269,10 @@ void hkv_engine_free(hkv_engine *engine);
 hkv_region *hkv_region_host_new(size_t len);
 
 /**
- * Wrap caller-owned memory. The memory must stay valid until the region handle is freed, and
- * must not be touched while the region is inside a buffer.
+ * Wrap caller-owned memory at `location`. The memory must stay valid until the region handle is
+ * freed, and must not be touched while the region is inside a buffer.
  */
-hkv_region *hkv_region_wrap(hkv_memory_kind kind, void *addr, size_t len);
+hkv_region *hkv_region_wrap(hkv_location location, void *addr, size_t len);
 
 /**
  * Host bytes of an owned region (NULL for device kinds).
@@ -306,7 +330,8 @@ hkv_buffer *hkv_buffer_new(const hkv_spec *spec, hkv_region **regions, size_t n)
 
 /**
  * Take the regions back into `out[0..n]` and free the buffer. Fails (buffer unchanged) while
- * a session or transfer still references it.
+ * a session, transfer or registration still references it, and with `HKV_STATE` for a
+ * resolved (reference) buffer.
  */
 hkv_status hkv_buffer_reclaim(hkv_buffer *buffer, hkv_region **out, size_t n);
 
@@ -354,13 +379,75 @@ hkv_status hkv_progress_finish(const hkv_progress *progress);
 void hkv_progress_free(hkv_progress *progress);
 
 /**
- * Session over an explicitly selected route; NULL (`HKV_UNSUPPORTED`) if the engine does not
- * serve it.
+ * New agent (`endpoint` may be NULL).
+ */
+hkv_agent *hkv_agent_new(const char *name, const char *endpoint);
+
+/**
+ * Agent id (0 for NULL); descriptors exported by the agent carry it.
+ */
+uint64_t hkv_agent_id(const hkv_agent *agent);
+
+/**
+ * Versioned handshake metadata bytes (see `write_bytes` conventions: `cap`, `*len`).
+ */
+hkv_status hkv_agent_meta(const hkv_agent *agent, uint8_t *out, size_t cap, size_t *len);
+
+/**
+ * Register `buffer` with the agent and describe it. `hash_blocks[i]` -> `hashes[i]` are optional
+ * integer block hashes (`n_hashes` may be 0).
+ */
+hkv_descriptor *hkv_agent_export(const hkv_agent *agent,
+                                 const hkv_buffer *buffer,
+                                 const uint32_t *hash_blocks,
+                                 const uint64_t *hashes,
+                                 size_t n_hashes);
+
+/**
+ * Drop the registrations of a descriptor this agent exported.
+ */
+hkv_status hkv_agent_release(const hkv_agent *agent, const hkv_descriptor *descriptor);
+
+/**
+ * Free an agent (its registrations, and so the registered memory, are released).
+ */
+void hkv_agent_free(hkv_agent *agent);
+
+/**
+ * Versioned wire bytes of a descriptor (`cap`/`*len` as for `hkv_agent_meta`).
+ */
+hkv_status hkv_descriptor_to_bytes(const hkv_descriptor *descriptor,
+                                   uint8_t *out,
+                                   size_t cap,
+                                   size_t *len);
+
+/**
+ * Decode descriptor bytes (from any peer).
+ */
+hkv_descriptor *hkv_descriptor_from_bytes(const uint8_t *data, size_t len);
+
+/**
+ * Resolve a descriptor to a buffer reference usable in sessions (P0: agents in this process;
+ * `HKV_UNSUPPORTED` otherwise). Free it with `hkv_buffer_free`.
+ */
+hkv_buffer *hkv_descriptor_resolve(const hkv_descriptor *descriptor);
+
+/**
+ * Free a descriptor (does not deregister; see `hkv_agent_release`).
+ */
+void hkv_descriptor_free(hkv_descriptor *descriptor);
+
+/**
+ * Session over an explicitly selected route `src -> dst`, converting `src_repr` to `dst_repr`
+ * (pass the same value twice for a plain copy); NULL (`HKV_UNSUPPORTED`) if the engine did not
+ * declare that route. Sessions are cheap: share one engine handle and create one session per
+ * request; any number may run concurrently from different threads.
  */
 hkv_session *hkv_session_new(const hkv_engine *engine,
-                             hkv_memory_kind src,
-                             hkv_memory_kind dst,
-                             hkv_representation representation);
+                             hkv_location src,
+                             hkv_location dst,
+                             hkv_representation src_repr,
+                             hkv_representation dst_repr);
 
 /**
  * Free a session. A poisoned session's retained buffers stay pinned (and uncertain memory is

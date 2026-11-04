@@ -7,8 +7,10 @@
 //!   threads (its operations serialize internally).
 //! * Strings are NUL-terminated UTF-8. Panics never cross the boundary (`HKV_PANIC`).
 //!
-//! P0 covers L1-L4 within one process with the host engine. Descriptors, agents, events and
-//! foreign (C-implemented) engines are exposed in later phases (NIXL plugin, P3).
+//! Covered: regions at device locations, specs, buffers, agents (registration, handshake
+//! metadata, descriptor export/import as bytes, resolution), sessions with Selection-based
+//! transfers and declared conversions, layer progress. Not yet: KV events and C-implemented
+//! engines (NIXL plugin, P3).
 
 #![allow(non_camel_case_types, clippy::missing_safety_doc)]
 
@@ -22,7 +24,11 @@ use hetero_kv::engine::{CopyEngine, Direction, HostEngine, Representation, Route
 use hetero_kv::kv::{
     Geometry, KvBuffer, KvKind, KvSpec, LayerProgress, Layout, Selection, Split, Strides,
 };
-use hetero_kv::memory::{MemoryKind, Region};
+use std::collections::BTreeMap;
+
+use hetero_kv::kv::{BlockHash, KvBufferRef, KvDescriptor};
+use hetero_kv::memory::{Location, MemoryKind, Region};
+use hetero_kv::session::Agent;
 use hetero_kv::session::{Session, SessionState, TransferId};
 use hetero_kv::Error;
 
@@ -62,6 +68,17 @@ pub enum hkv_memory_kind {
     HKV_MEM_ATOM = 4,
     HKV_MEM_STORAGE = 5,
     HKV_MEM_REMOTE = 6,
+}
+
+/// Where memory lives: kind, device index, and an optional node id (cross-host, later phases).
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct hkv_location {
+    pub kind: hkv_memory_kind,
+    pub index: u32,
+    /// Non-zero if `node` is set; P0 routes accept local locations only.
+    pub has_node: bool,
+    pub node: u64,
 }
 
 /// KV element encodings.
@@ -175,8 +192,26 @@ pub struct hkv_engine(Arc<dyn CopyEngine>);
 pub struct hkv_region(Region);
 /// KV spec handle.
 pub struct hkv_spec(KvSpec);
-/// KV buffer handle (owns its regions while it exists).
-pub struct hkv_buffer(KvBuffer);
+/// KV buffer handle: an owned buffer (owns its regions) or a reference resolved from a
+/// descriptor (cannot be reclaimed).
+pub enum hkv_buffer {
+    Owned(KvBuffer),
+    Ref(KvBufferRef),
+}
+
+impl hkv_buffer {
+    fn share(&self) -> KvBufferRef {
+        match self {
+            hkv_buffer::Owned(b) => b.share(),
+            hkv_buffer::Ref(r) => r.clone(),
+        }
+    }
+}
+
+/// Agent handle: identity, registration and descriptors.
+pub struct hkv_agent(Agent);
+/// Serializable KV buffer descriptor.
+pub struct hkv_descriptor(KvDescriptor);
 /// Session handle.
 pub struct hkv_session(Session);
 /// Layer-progress handle.
@@ -269,8 +304,13 @@ unsafe fn slice_arg<'a, T>(p: *const T, n: usize) -> R<&'a [T]> {
     Ok(std::slice::from_raw_parts(p, n))
 }
 
-fn kind(k: hkv_memory_kind) -> MemoryKind {
-    MemoryKind::ALL[k as usize]
+fn location(l: &hkv_location) -> Location {
+    let loc = Location::new(MemoryKind::ALL[l.kind as usize], l.index);
+    if l.has_node {
+        loc.on_node(l.node)
+    } else {
+        loc
+    }
 }
 
 fn repr(r: hkv_representation) -> Representation {
@@ -332,17 +372,17 @@ pub extern "C" fn hkv_region_host_new(len: usize) -> *mut hkv_region {
     construct(|| Ok(hkv_region(Region::host(len)?)))
 }
 
-/// Wrap caller-owned memory. The memory must stay valid until the region handle is freed, and
-/// must not be touched while the region is inside a buffer.
+/// Wrap caller-owned memory at `location`. The memory must stay valid until the region handle is
+/// freed, and must not be touched while the region is inside a buffer.
 #[no_mangle]
 pub unsafe extern "C" fn hkv_region_wrap(
-    kind: hkv_memory_kind,
+    location: hkv_location,
     addr: *mut c_void,
     len: usize,
 ) -> *mut hkv_region {
     construct(|| {
         Ok(hkv_region(Region::external(
-            self::kind(kind),
+            self::location(&location),
             addr as usize,
             len,
             None,
@@ -483,12 +523,13 @@ pub unsafe extern "C" fn hkv_buffer_new(
                 Box::from_raw(p).0
             })
             .collect();
-        Ok(hkv_buffer(KvBuffer::new(spec.clone(), owned)?))
+        Ok(hkv_buffer::Owned(KvBuffer::new(spec.clone(), owned)?))
     })
 }
 
 /// Take the regions back into `out[0..n]` and free the buffer. Fails (buffer unchanged) while
-/// a session or transfer still references it.
+/// a session, transfer or registration still references it, and with `HKV_STATE` for a
+/// resolved (reference) buffer.
 #[no_mangle]
 pub unsafe extern "C" fn hkv_buffer_reclaim(
     buffer: *mut hkv_buffer,
@@ -499,13 +540,24 @@ pub unsafe extern "C" fn hkv_buffer_reclaim(
         if buffer.is_null() || out.is_null() {
             return Err(Fail::Null);
         }
-        if (*buffer).0.regions().len() != n {
-            return Err(
-                Error::Invalid("output array length differs from region count".into()).into(),
-            );
+        match &*buffer {
+            hkv_buffer::Ref(_) => {
+                return Err(Error::State(
+                    "a resolved buffer reference has no regions to reclaim".into(),
+                )
+                .into())
+            }
+            hkv_buffer::Owned(b) if b.regions().len() != n => {
+                return Err(
+                    Error::Invalid("output array length differs from region count".into()).into(),
+                )
+            }
+            hkv_buffer::Owned(_) => {}
         }
-        let buf = Box::from_raw(buffer);
-        match buf.0.reclaim() {
+        let hkv_buffer::Owned(buf) = *Box::from_raw(buffer) else {
+            unreachable!("checked above")
+        };
+        match buf.reclaim() {
             Ok(regions) => {
                 for (i, r) in regions.into_iter().enumerate() {
                     *out.add(i) = Box::into_raw(Box::new(hkv_region(r)));
@@ -515,7 +567,7 @@ pub unsafe extern "C" fn hkv_buffer_reclaim(
             Err(fail) => {
                 let (b, e) = (fail.buffer, fail.error);
                 // Put the buffer back at the caller's address.
-                std::ptr::write(buffer, hkv_buffer(b));
+                std::ptr::write(buffer, hkv_buffer::Owned(b));
                 Err(e.into())
             }
         }
@@ -615,20 +667,161 @@ pub unsafe extern "C" fn hkv_progress_free(progress: *mut hkv_progress) {
     }
 }
 
+// --- L4 agents and descriptors --------------------------------------------------------------
+
+/// New agent (`endpoint` may be NULL).
+#[no_mangle]
+pub unsafe extern "C" fn hkv_agent_new(
+    name: *const c_char,
+    endpoint: *const c_char,
+) -> *mut hkv_agent {
+    construct(|| {
+        let endpoint = if endpoint.is_null() {
+            None
+        } else {
+            Some(str_arg(endpoint)?.to_owned())
+        };
+        Ok(hkv_agent(Agent::new(str_arg(name)?, endpoint)))
+    })
+}
+
+/// Agent id (0 for NULL); descriptors exported by the agent carry it.
+#[no_mangle]
+pub unsafe extern "C" fn hkv_agent_id(agent: *const hkv_agent) -> u64 {
+    agent.as_ref().map_or(0, |a| a.0.id())
+}
+
+/// Copy `bytes` into `out[0..cap]`; `*len` always receives the full size. `HKV_INVALID` if
+/// `cap` is too small (call with `cap == 0` to size the buffer).
+unsafe fn write_bytes(bytes: &[u8], out: *mut u8, cap: usize, len: *mut usize) -> R<()> {
+    *len.as_mut().ok_or(Fail::Null)? = bytes.len();
+    if cap < bytes.len() {
+        return Err(Error::Invalid(format!("buffer of {cap} bytes, need {}", bytes.len())).into());
+    }
+    if !bytes.is_empty() {
+        if out.is_null() {
+            return Err(Fail::Null);
+        }
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), out, bytes.len());
+    }
+    Ok(())
+}
+
+/// Versioned handshake metadata bytes (see `write_bytes` conventions: `cap`, `*len`).
+#[no_mangle]
+pub unsafe extern "C" fn hkv_agent_meta(
+    agent: *const hkv_agent,
+    out: *mut u8,
+    cap: usize,
+    len: *mut usize,
+) -> hkv_status {
+    guard(|| write_bytes(&ref_arg(agent)?.0.meta().to_bytes(), out, cap, len))
+}
+
+/// Register `buffer` with the agent and describe it. `hash_blocks[i]` -> `hashes[i]` are optional
+/// integer block hashes (`n_hashes` may be 0).
+#[no_mangle]
+pub unsafe extern "C" fn hkv_agent_export(
+    agent: *const hkv_agent,
+    buffer: *const hkv_buffer,
+    hash_blocks: *const u32,
+    hashes: *const u64,
+    n_hashes: usize,
+) -> *mut hkv_descriptor {
+    construct(|| {
+        let blocks = slice_arg(hash_blocks, n_hashes)?;
+        let values = slice_arg(hashes, n_hashes)?;
+        let map: BTreeMap<u32, BlockHash> = blocks
+            .iter()
+            .zip(values)
+            .map(|(&b, &h)| (b, BlockHash::Int(h)))
+            .collect();
+        let buf = ref_arg(buffer)?.share();
+        Ok(hkv_descriptor(ref_arg(agent)?.0.export(&buf, map)?))
+    })
+}
+
+/// Drop the registrations of a descriptor this agent exported.
+#[no_mangle]
+pub unsafe extern "C" fn hkv_agent_release(
+    agent: *const hkv_agent,
+    descriptor: *const hkv_descriptor,
+) -> hkv_status {
+    guard(|| Ok(ref_arg(agent)?.0.release(&ref_arg(descriptor)?.0)?))
+}
+
+/// Free an agent (its registrations, and so the registered memory, are released).
+#[no_mangle]
+pub unsafe extern "C" fn hkv_agent_free(agent: *mut hkv_agent) {
+    if !agent.is_null() {
+        drop(Box::from_raw(agent));
+    }
+}
+
+/// Versioned wire bytes of a descriptor (`cap`/`*len` as for `hkv_agent_meta`).
+#[no_mangle]
+pub unsafe extern "C" fn hkv_descriptor_to_bytes(
+    descriptor: *const hkv_descriptor,
+    out: *mut u8,
+    cap: usize,
+    len: *mut usize,
+) -> hkv_status {
+    guard(|| write_bytes(&ref_arg(descriptor)?.0.to_bytes(), out, cap, len))
+}
+
+/// Decode descriptor bytes (from any peer).
+#[no_mangle]
+pub unsafe extern "C" fn hkv_descriptor_from_bytes(
+    data: *const u8,
+    len: usize,
+) -> *mut hkv_descriptor {
+    construct(|| {
+        Ok(hkv_descriptor(KvDescriptor::from_bytes(slice_arg(
+            data, len,
+        )?)?))
+    })
+}
+
+/// Resolve a descriptor to a buffer reference usable in sessions (P0: agents in this process;
+/// `HKV_UNSUPPORTED` otherwise). Free it with `hkv_buffer_free`.
+#[no_mangle]
+pub unsafe extern "C" fn hkv_descriptor_resolve(
+    descriptor: *const hkv_descriptor,
+) -> *mut hkv_buffer {
+    construct(|| Ok(hkv_buffer::Ref(ref_arg(descriptor)?.0.resolve()?)))
+}
+
+/// Free a descriptor (does not deregister; see `hkv_agent_release`).
+#[no_mangle]
+pub unsafe extern "C" fn hkv_descriptor_free(descriptor: *mut hkv_descriptor) {
+    if !descriptor.is_null() {
+        drop(Box::from_raw(descriptor));
+    }
+}
+
 // --- L4 sessions ---------------------------------------------------------------------------
 
-/// Session over an explicitly selected route; NULL (`HKV_UNSUPPORTED`) if the engine does not
-/// serve it.
+/// Session over an explicitly selected route `src -> dst`, converting `src_repr` to `dst_repr`
+/// (pass the same value twice for a plain copy); NULL (`HKV_UNSUPPORTED`) if the engine did not
+/// declare that route. Sessions are cheap: share one engine handle and create one session per
+/// request; any number may run concurrently from different threads.
 #[no_mangle]
 pub unsafe extern "C" fn hkv_session_new(
     engine: *const hkv_engine,
-    src: hkv_memory_kind,
-    dst: hkv_memory_kind,
-    representation: hkv_representation,
+    src: hkv_location,
+    dst: hkv_location,
+    src_repr: hkv_representation,
+    dst_repr: hkv_representation,
 ) -> *mut hkv_session {
     construct(|| {
         let engine = ref_arg(engine)?.0.clone();
-        let route = Route::select(engine, kind(src), kind(dst), repr(representation))?;
+        let route = Route::select_converting(
+            engine,
+            location(&src),
+            location(&dst),
+            repr(src_repr),
+            repr(dst_repr),
+        )?;
         Ok(hkv_session(Session::new(route)))
     })
 }
@@ -668,7 +861,7 @@ pub unsafe extern "C" fn hkv_session_reserve(
         let s = ref_arg(session)?;
         let bufs = slice_arg(dst, n)?
             .iter()
-            .map(|&b| ref_arg(b).map(|b| b.0.share()))
+            .map(|&b| ref_arg(b).map(|b| b.share()))
             .collect::<R<Vec<_>>>()?;
         Ok(s.0.reserve(str_arg(request_id)?, bufs)?)
     })
@@ -689,7 +882,7 @@ pub unsafe extern "C" fn hkv_session_transfer(
 ) -> hkv_status {
     guard(|| {
         let s = ref_arg(session)?;
-        let src = ref_arg(src)?.0.share();
+        let src = ref_arg(src)?.share();
         let sels = slice_arg(selections, n)?
             .iter()
             .map(|c| {
@@ -846,20 +1039,17 @@ mod tests {
             assert_eq!(hkv_session_recover(std::ptr::null()), hkv_status::HKV_NULL);
             assert!(!CStr::from_ptr(hkv_last_error()).to_bytes().is_empty());
             assert!(hkv_region_host_new(0).is_null());
-            assert!(hkv_session_new(
-                std::ptr::null(),
-                hkv_memory_kind::HKV_MEM_HOST,
-                hkv_memory_kind::HKV_MEM_HOST,
-                hkv_representation::HKV_BF16
-            )
-            .is_null());
+            let at = |kind| hkv_location {
+                kind,
+                index: 0,
+                has_node: false,
+                node: 0,
+            };
+            let bf16 = hkv_representation::HKV_BF16;
+            let host = at(hkv_memory_kind::HKV_MEM_HOST);
+            assert!(hkv_session_new(std::ptr::null(), host, host, bf16, bf16).is_null());
             let e = hkv_host_engine_new();
-            let s = hkv_session_new(
-                e,
-                hkv_memory_kind::HKV_MEM_HOST,
-                hkv_memory_kind::HKV_MEM_CUDA,
-                hkv_representation::HKV_BF16,
-            );
+            let s = hkv_session_new(e, host, at(hkv_memory_kind::HKV_MEM_CUDA), bf16, bf16);
             assert!(s.is_null());
             assert!(CStr::from_ptr(hkv_last_error())
                 .to_str()

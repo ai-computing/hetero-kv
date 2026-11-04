@@ -1,5 +1,6 @@
-/* C smoke test: reserve -> transfer -> fence -> admit -> finish with the host engine, plus
- * route rejection, layer progress and reclaim. Build: see tests/c/run.sh. */
+/* C smoke test: reserve -> transfer -> fence -> admit -> finish with the host engine; route
+ * rejection; agent registration, descriptor export/import as bytes and a pull through the
+ * resolved descriptor; layer progress; reclaim. Build: see tests/c/run.sh. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,11 +42,13 @@ int main(void) {
   if (!spec) return fprintf(stderr, "spec: %s\n", hkv_last_error()), 1;
 
   hkv_engine *engine = hkv_host_engine_new();
-  /* No silent fallback: the host engine has no host -> CUDA route. */
-  if (hkv_session_new(engine, HKV_MEM_HOST, HKV_MEM_CUDA, HKV_BF16) != NULL) return 1;
+  hkv_location host = {HKV_MEM_HOST, 0, false, 0}, cuda1 = {HKV_MEM_CUDA, 1, false, 0};
+  /* No silent fallback: the host engine has no host -> cuda:1 route, and no conversions. */
+  if (hkv_session_new(engine, host, cuda1, HKV_BF16, HKV_BF16) != NULL) return 1;
   printf("rejected as expected: %s\n", hkv_last_error());
+  if (hkv_session_new(engine, host, host, HKV_BF16, HKV_DLFLOAT16) != NULL) return 1;
 
-  hkv_session *session = hkv_session_new(engine, HKV_MEM_HOST, HKV_MEM_HOST, HKV_BF16);
+  hkv_session *session = hkv_session_new(engine, host, host, HKV_BF16, HKV_BF16);
   hkv_buffer *src = make_buffer(spec, 7), *dst = make_buffer(spec, 0);
   if (!session || !src || !dst) return 1;
 
@@ -65,13 +68,48 @@ int main(void) {
     return 1;
   }
 
-  /* Verify: each head's first 5 rows (5 * 8 bytes) of each region match. */
+  /* Pull through a descriptor: export src, ship it as bytes, resolve it on the "decode" side and
+   * copy the remaining tokens 5..8 with direction = read. */
+  hkv_agent *prefill = hkv_agent_new("prefill", "prefill:5555");
+  uint32_t hash_block = 0;
+  uint64_t hash = 42;
+  hkv_descriptor *desc = hkv_agent_export(prefill, src, &hash_block, &hash, 1);
+  if (!desc) return fprintf(stderr, "export: %s\n", hkv_last_error()), 1;
+  size_t len = 0;
+  if (hkv_descriptor_to_bytes(desc, NULL, 0, &len) != HKV_INVALID || len == 0) return 1;
+  uint8_t *wire = malloc(len);
+  CHECK(hkv_descriptor_to_bytes(desc, wire, len, &len));
+  size_t meta_len = 0;
+  hkv_agent_meta(prefill, NULL, 0, &meta_len);
+  if (meta_len == 0) return 1;
+
+  hkv_descriptor *received = hkv_descriptor_from_bytes(wire, len);
+  hkv_buffer *remote_src = received ? hkv_descriptor_resolve(received) : NULL;
+  if (!remote_src) return fprintf(stderr, "resolve: %s\n", hkv_last_error()), 1;
+  hkv_region *none[1];
+  if (hkv_buffer_reclaim(remote_src, none, 1) != HKV_STATE) return 1; /* references have no regions */
+  CHECK(hkv_session_reserve(session, "req-2", dsts, 1));
+  hkv_selection rest = {0, 2, &block0, 1, &block0, 1, 5, 5, 3};
+  CHECK(hkv_session_transfer(session, "req-2", 0, remote_src, &rest, 1, 1, &id));
+  CHECK(hkv_session_fence(session, "req-2", &receipt));
+  CHECK(hkv_session_admit(session, "req-2", NULL, NULL));
+  CHECK(hkv_session_finish(session, "req-2", true));
+  if (receipt.bytes != 2 * 2 * 2 * 3 * 8) return 1;
+  hkv_buffer_free(remote_src);
+  hkv_descriptor_free(received);
   hkv_region *a[4], *b[4];
+  if (hkv_buffer_reclaim(src, a, 4) != HKV_BUSY) return 1; /* still registered */
+  CHECK(hkv_agent_release(prefill, desc));
+  hkv_descriptor_free(desc);
+  hkv_agent_free(prefill);
+  free(wire);
+
+  /* Verify: each head's 8 rows (8 * 8 bytes) of each region match. */
   CHECK(hkv_buffer_reclaim(src, a, 4));
   CHECK(hkv_buffer_reclaim(dst, b, 4));
   for (int r = 0; r < 4; r++)
     for (int h = 0; h < 2; h++)
-      if (memcmp(hkv_region_data(a[r]) + h * 64, hkv_region_data(b[r]) + h * 64, 40) != 0) return 1;
+      if (memcmp(hkv_region_data(a[r]) + h * 64, hkv_region_data(b[r]) + h * 64, 64) != 0) return 1;
   for (int r = 0; r < 4; r++) {
     hkv_region_free(a[r]);
     hkv_region_free(b[r]);

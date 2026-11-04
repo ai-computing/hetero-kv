@@ -148,7 +148,7 @@ def test_descriptors_events_and_agents():
         decode.publish({"type": "Nope"})
 
 
-# Layer progress: the Optimus tests (test_pd_layer_progress.py), unchanged in substance.
+# Layer progress: the Optimus tests (aicomp test_pd_layer_progress.py), unchanged in substance.
 
 def test_partial_prefix_and_out_of_order_layers_require_complete_coverage():
     p = hk.LayerProgress(3, 5, 9)

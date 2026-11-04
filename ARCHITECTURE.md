@@ -7,7 +7,7 @@ stay in the engines and KV managers that use it. Design: Issue #1; P0 scope: Iss
 
 ```
  L5 bindings   hetero-kv-py (Python `hetero_kv`) · hetero-kv-capi (C ABI, include/hetero_kv.h)
-               adapters/: optimus (real) · vllm, kvstore, nixl (skeletons / notes)
+               adapters/: vllm, kvstore, nixl (skeletons / notes)
  L4 session    reserve -> transfer -> fence -> admit -> finish; cancel; poison      session::
                agents: identity + registry + events; handshake metadata
  L3 KV         KvSpec, Layout (blocks, strides, K/V or MLA latent), Selection -> Plan  kv::

@@ -22,23 +22,21 @@ this release; everything else names the phase that adds it (Issue #1).
 
 ## Optimus Prime (aicomp optimus-rm `accel/pd`) — P0, real
 
+Optimus owns its glue: `opt_prime/accel/pd/transport.py` in aicomp optimus-rm (aicomp#298) maps
+its caches and DMA plans onto hetero-kv and depends on this package (`pd` extra). hetero-kv never
+imports Optimus.
+
 | Optimus | hetero-kv |
 |---|---|
-| `contracts.KVSpec(model_id, revision, representation, layout, shape)` | `KVSpec(model_id, revision, Layout)`; Optimus keeps its own spec for lane negotiation, the adapter derives the hetero-kv spec from the cache tensors |
-| `Transport.supports(src, dst, spec)` | adapter checks the configured endpoints; engine routes are checked by `Session(...)` (`UnsupportedError`, no fallback) |
-| `Transport.transfer(...)` "returns only after verified completion and visibility" | `reserve` + `transfer` + `fence` + `admit(notify)` (`hetero_kv.transfer_and_admit`) |
-| `Transport.finish(request_id)` | `Session.finish(request_id)` |
-| `recover()` | `Session.recover()` (engine quiesce); a still-admitted request is finished as failed first |
-| `RetryableError` vs poison | hetero-kv rejections (`InvalidError`, `UnsupportedError`, `StateError`) guarantee nothing was submitted; the adapter re-raises them (`ValueError` subclasses) and Optimus' runtime keeps its own policy |
-| `torch_cache.TorchCacheTransport` | `hetero_kv_optimus.TorchCacheTransport` (`TorchCopyEngine`, bhsd layout, one KV group per distinct layer shape) |
-| `layer_progress.LayerProgress` | `hetero_kv.LayerProgress` (same semantics and messages) |
-| `hetero_p2p.HeteroP2PTransport` + `CopySession` | `hetero_kv_optimus.SessionTransport(..., src_location="rngd:3", dst_location="atom:2")` + `Session` (fenced = CopySession "ready", admitted = "decoding") |
+| `contracts.KVSpec(model_id, revision, representation, layout, shape)` | `KVSpec(model_id, revision, Layout)`; Optimus keeps its own spec for lane negotiation and derives the hetero-kv spec from the cache tensors |
+| `Transport.supports(src, dst, spec)` | Optimus checks the configured endpoints; engine routes are checked by `Session(...)` (`UnsupportedError`, no fallback) |
+| `Transport.transfer(...)` "returns only after verified completion and visibility" | `reserve` + `transfer` + `fence` + `admit(notify)` |
+| `Transport.finish(request_id)` / `recover()` | `Session.finish(request_id)` / `Session.recover()` (engine quiesce); a still-admitted request is finished as failed first |
+| `RetryableError` vs poison | hetero-kv rejections (`InvalidError`, `UnsupportedError`, `StateError`) guarantee nothing was submitted; Optimus re-raises them and its runtime keeps its own policy |
+| `transport.TorchCacheTransport` | `TorchCopyEngine`, `bhsd` layout over `KVCacheManager.storage(layer)`, one KV group per distinct layer shape; batch entries are separate transfers on the same tensors (disjoint byte ranges) |
+| `LayerProgress` (streaming coverage) | `hetero_kv.LayerProgress` (same semantics and messages) |
+| `transport.SessionTransport` / `p2p_transport` (RNGD -> ATOM) | `Session` over any engine; for the existing hetero-npu-p2p RNGD PDMA backend, a Python engine runs each job as that library's validated `TransferPlan` (flat 4 KiB-row layouts, one selection per DMA span) until the native RNGD engine (P2) |
 | `npu/shared_kv.SharedKVSlab` (memfd host slab) | stays in Optimus; its mapping can be wrapped with `Region.from_buffer` for host-engine copies. Fd passing across processes is P3. |
-
-Verified locally against optimus-rm `fff45de`: Optimus' own `tests/ -k pd` suite (193 passed,
-21 skipped) gives the same result with `torch_cache.TorchCacheTransport` and `LayerProgress`
-swapped for the adapter's. Batch entries of a `KVCacheManager` go as separate transfers on the
-same tensors (disjoint byte ranges).
 
 ## vLLM KV connector
 

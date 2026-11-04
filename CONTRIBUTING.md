@@ -29,6 +29,6 @@ merges.
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --exclude hetero-kv-py
-(cd crates/hetero-kv-py && maturin develop) && pytest tests/python adapters/optimus/tests
+(cd crates/hetero-kv-py && maturin develop) && pytest tests/python
 tests/c/run.sh
 ```

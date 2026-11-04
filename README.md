@@ -6,7 +6,8 @@ TensorRT-LLM), KV managers (LMCache, Mooncake, Dynamo KVBM) and llm-d keep model
 scheduling and indexing.
 
 **Status: P0, host only.** L1–L4 API, host reference engine, Python-provided engines (a Torch
-`copy_` engine is included), C ABI, CPU CI, and a tested Optimus Prime adapter. CUDA (P1), RNGD
+`copy_` engine is included), C ABI and CPU CI; Optimus Prime uses it for its PD KV transport
+(its glue lives in aicomp optimus-rm `opt_prime/accel/pd/transport.py`). CUDA (P1), RNGD
 PDMA <-> DMA-BUF (P2), NIXL and cross-process sessions (P3) follow; see Issue #1.
 
 ## Layers
@@ -29,6 +30,13 @@ Rules and diagrams: [ARCHITECTURE.md](ARCHITECTURE.md). Consumer mapping and gap
 ```sh
 python3 -m venv .venv && .venv/bin/pip install maturin pytest
 (cd crates/hetero-kv-py && ../../.venv/bin/maturin develop)
+```
+
+As a dependency (builds from source with the maturin backend; needs a Rust toolchain), pinned
+to a commit:
+
+```sh
+pip install "hetero-kv @ git+https://github.com/ai-computing/hetero-kv@<commit>#subdirectory=crates/hetero-kv-py"
 ```
 
 ```python
@@ -106,7 +114,7 @@ Full example: [`tests/c/smoke.c`](tests/c/smoke.c). Every call returns `hkv_stat
 crates/hetero-kv        core (L1-L4); cargo features cuda, rngd, atom, nixl reserved (empty)
 crates/hetero-kv-capi   C ABI cdylib/staticlib; header generated into include/hetero_kv.h
 crates/hetero-kv-py     PyO3 module + pure-Python package hetero_kv (py.typed, stubs)
-adapters/               optimus (real), vllm, kvstore, nixl (skeletons / notes)
+adapters/               vllm, kvstore, nixl (skeletons / notes); consumers own their glue
 tests/python, tests/c   Python tests, C smoke test
 ```
 
@@ -115,7 +123,7 @@ tests/python, tests/c   Python tests, C smoke test
 ```sh
 cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --exclude hetero-kv-py
-(cd crates/hetero-kv-py && maturin develop) && pytest tests/python adapters/optimus/tests
+(cd crates/hetero-kv-py && maturin develop) && pytest tests/python
 tests/c/run.sh
 scripts/gen-header.sh   # after changing the C ABI (needs cbindgen); CI checks the header is current
 ```

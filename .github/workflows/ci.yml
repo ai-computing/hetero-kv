@@ -55,6 +55,5 @@ jobs:
           .venv/bin/pip install maturin pytest
           .venv/bin/pip install torch --index-url https://download.pytorch.org/whl/cpu
           (cd crates/hetero-kv-py && ../../.venv/bin/maturin develop)
-          .venv/bin/pip install -e adapters/optimus
       - name: pytest
-        run: .venv/bin/python -m pytest -v tests/python adapters/optimus/tests
+        run: .venv/bin/python -m pytest -v tests/python

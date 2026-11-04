@@ -8,7 +8,7 @@
 //! This tracks *source writes* only. A consumer must still fence its own copies before it
 //! publishes the cache or releases the reservation: source completion is not a fence.
 //!
-//! Semantics and error messages match Optimus `accel/pd/layer_progress.py`. Arguments are
+//! Semantics and error messages match Optimus' former `accel/pd/layer_progress.py`. Arguments are
 //! signed so negative values from foreign callers are rejected with the same messages.
 
 use std::sync::Mutex;

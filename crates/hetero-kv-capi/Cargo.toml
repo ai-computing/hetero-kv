@@ -1,0 +1,18 @@
+[package]
+name = "hetero-kv-capi"
+description = "C ABI for hetero-kv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+# Output is libhetero_kv.{so,a}. The library shares its name with the core crate, so it has no
+# doctests (rustdoc could not tell the two rlibs apart).
+name = "hetero_kv"
+crate-type = ["cdylib", "staticlib", "lib"]
+doctest = false
+
+[dependencies]
+hetero-kv.workspace = true

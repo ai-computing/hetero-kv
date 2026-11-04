@@ -1,0 +1,17 @@
+[package]
+name = "hetero-kv-py"
+description = "Python bindings for hetero-kv"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+hetero-kv.workspace = true
+pyo3 = { version = "0.27", features = ["extension-module"] }
+serde_json.workspace = true

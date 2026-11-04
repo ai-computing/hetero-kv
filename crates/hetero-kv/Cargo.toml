@@ -1,0 +1,25 @@
+[package]
+name = "hetero-kv"
+description = "Layered KV-cache transport between heterogeneous accelerators"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+default = []
+# Reserved for later phases (Issue #1); empty in P0 and enable nothing.
+# P1: CUDA engine (CUDA driver API, pinned staging, own stream).
+cuda = []
+# P2: RNGD PDMA <-> DMA-BUF engine (RNGD kernel driver UAPI).
+rngd = []
+# P2: ATOM device memory (documented driver/SDK interfaces only).
+atom = []
+# P3: NIXL backend / cross-process transport.
+nixl = []
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

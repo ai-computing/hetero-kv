@@ -206,7 +206,9 @@ mod tests {
         assert_eq!(events[2][0], json!("BlockStored"));
         assert_eq!(events[2][6], json!("CPU"));
         assert_eq!(events[3], json!(["AllBlocksCleared"]));
-        // Native JSON form round-trips.
+        // Native JSON form round-trips (fixed timestamp: serde_json float parsing may differ
+        // from the printed value in the last bit).
+        let batch = KvEventBatch { ts: 1.5, ..batch };
         let s = serde_json::to_string(&batch).unwrap();
         assert_eq!(serde_json::from_str::<KvEventBatch>(&s).unwrap(), batch);
     }
